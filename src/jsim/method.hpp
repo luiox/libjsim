@@ -205,12 +205,16 @@ struct CpEntry {
 };
 
 /// 调用点引用。invoke 系的操作数指向这里；接管注册按 owner+name+desc 匹配。
+///
+/// `isStatic` 决定栈上有没有接收者：跨方法编排（消费方执行器）要按它弹参数，
+/// 否则会把 receiver 当成第一个实参，静默错位。引擎自身不看这个字段。
 struct CallRef {
     std::string owner;
     std::string name;
     std::string desc;
     ValType retType = ValType::I32;
     bool hasReturn = true; // <init> 等 void 调用为 false，引擎不压返回值
+    bool isStatic = false; // invokestatic / invokedynamic 为 true
 };
 
 /// 静态字段引用。getstatic/putstatic 的操作数指向这里；值存在 Session.statics。
@@ -374,7 +378,7 @@ public:
     MethodBuilder& invoke(std::string owner, std::string name, std::string desc,
                           ValType retType, bool hasReturn = true) {
         method_.calls.push_back(
-            {std::move(owner), std::move(name), std::move(desc), retType, hasReturn});
+            {std::move(owner), std::move(name), std::move(desc), retType, hasReturn, true});
         return raw(op::InvokeStatic, static_cast<i32>(method_.calls.size()) - 1);
     }
 
@@ -387,7 +391,7 @@ public:
 
     MethodBuilder& invokeSpecial(std::string owner, std::string name, std::string desc) {
         method_.calls.push_back({std::move(owner), std::move(name), std::move(desc),
-                                 ValType::I32, false});
+                                 ValType::I32, false, false});
         return raw(op::InvokeSpecial, static_cast<i32>(method_.calls.size()) - 1);
     }
 
