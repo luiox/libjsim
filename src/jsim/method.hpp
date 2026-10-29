@@ -319,6 +319,13 @@ public:
         return raw(op::ANewArray, static_cast<i32>(method_.allocTypes.size()) - 1);
     }
 
+    /// multianewarray：elemType 是元素类型（"I" → int[][]），dims ≥ 2；
+    /// 栈上按 count1（最外层）… countn（最内层）压入。
+    MethodBuilder& multiANewArray(std::string elemType, i32 dims) {
+        method_.allocTypes.push_back(std::move(elemType));
+        return raw(op::MultiANewArray, static_cast<i32>(method_.allocTypes.size()) - 1, dims);
+    }
+
     MethodBuilder& arraylength() { return raw(op::ArrayLength); }
     MethodBuilder& iaload() { return raw(op::IALoad); }
     MethodBuilder& iastore() { return raw(op::IAStore); }
@@ -363,6 +370,10 @@ public:
     MethodBuilder& ifIcmpne(u32 target) { return raw(op::IfIcmpne, static_cast<i32>(target)); }
     MethodBuilder& ifIcmpge(u32 target) { return raw(op::IfIcmpge, static_cast<i32>(target)); }
     MethodBuilder& ifIcmplt(u32 target) { return raw(op::IfIcmplt, static_cast<i32>(target)); }
+    MethodBuilder& ifAcmpeq(u32 target) { return raw(op::IfAcmpeq, static_cast<i32>(target)); }
+    MethodBuilder& ifAcmpne(u32 target) { return raw(op::IfAcmpne, static_cast<i32>(target)); }
+    MethodBuilder& ifNull(u32 target) { return raw(op::IfNull, static_cast<i32>(target)); }
+    MethodBuilder& ifNonNull(u32 target) { return raw(op::IfNonNull, static_cast<i32>(target)); }
 
     /// cases 逐项对应 [min, min + cases.size() - 1]；范围外走 defaultPc。
     MethodBuilder& tableswitch(i32 min, std::vector<u32> cases, u32 defaultPc) {

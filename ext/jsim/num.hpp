@@ -18,8 +18,10 @@ namespace num {
 
 namespace detail {
 
-/// 十进制解析（可带正负号）。溢出按 JVM 口径回绕，不做饱和。
-inline bool parseDecimal(const std::string& text, i64& out) {
+/// 十进制解析（可带正负号）。越界按 JDK parseInt/parseLong 口径算解析失败
+/// （真机抛 NumberFormatException，本包按契约 Bail），不回绕、不饱和——回绕是
+/// 算术口径，不是解析口径。
+inline bool parseDecimal(const std::string& text, u64 posLimit, u64 negLimit, i64& out) {
     usize i = 0;
     bool negative = false;
     if (i < text.size() && (text[i] == '+' || text[i] == '-')) {
@@ -31,8 +33,11 @@ inline bool parseDecimal(const std::string& text, i64& out) {
     for (; i < text.size(); ++i) {
         const char ch = text[i];
         if (ch < '0' || ch > '9') return false;
-        acc = acc * 10u + static_cast<u64>(ch - '0');
+        const u64 digit = static_cast<u64>(ch - '0');
+        if (acc > (UINT64_MAX - digit) / 10) return false; // 位数溢出
+        acc = acc * 10 + digit;
     }
+    if (negative ? acc > negLimit : acc > posLimit) return false;
     out = static_cast<i64>(negative ? 0u - acc : acc);
     return true;
 }
@@ -79,10 +84,10 @@ inline void install(Session& session) {
             return Result<SimValue, Bail>::ok(SimValue::unknownOf(ValType::I32));
         }
         i64 parsed = 0;
-        if (!detail::parseDecimal(arg.value().ref.str, parsed)) {
+        if (!detail::parseDecimal(arg.value().ref.str, 2147483647u, 2147483648ull, parsed)) {
             return Result<SimValue, Bail>::err(
                 {Bail::Reason::NotConcrete, frame.pc(),
-                 "Integer.parseInt 失败需 NumberFormatException 派发（v1 不做）"});
+                 "Integer.parseInt 失败或越界需 NumberFormatException 派发（v1 不做）"});
         }
         return Result<SimValue, Bail>::ok(SimValue::knownI32(static_cast<i32>(parsed)));
     };
@@ -95,10 +100,11 @@ inline void install(Session& session) {
             return Result<SimValue, Bail>::ok(SimValue::unknownOf(ValType::I64));
         }
         i64 parsed = 0;
-        if (!detail::parseDecimal(arg.value().ref.str, parsed)) {
+        if (!detail::parseDecimal(arg.value().ref.str, UINT64_C(9223372036854775807),
+                                  UINT64_C(1) << 63, parsed)) {
             return Result<SimValue, Bail>::err(
                 {Bail::Reason::NotConcrete, frame.pc(),
-                 "Long.parseLong 失败需 NumberFormatException 派发（v1 不做）"});
+                 "Long.parseLong 失败或越界需 NumberFormatException 派发（v1 不做）"});
         }
         return Result<SimValue, Bail>::ok(SimValue::knownI64(parsed));
     };

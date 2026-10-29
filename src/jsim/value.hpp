@@ -67,6 +67,10 @@ struct RefPayload {
     Kind kind = Kind::Null;
     std::string str; // Kind == Str 时有效；MVP 用 std::string 替身，正式版换 libjstr Utf8String 家族
     u64 objId = 0;   // Kind == Obj 时有效，会话内单调序号，0 保留
+    /// Str 的身份事实（不是诊断，不违反 D2）：ldc 字面量为 true——常量池 intern
+    /// 保证同内容字面量是同一对象，引用相等可判；动态构造的字符串为 false——
+    /// 真实 JVM 里是新对象，模型里没有第二身份键，身份不可判（见 compareRef）。
+    bool interned = false;
 };
 
 /// SimValue 三要素。Unknown 时载荷不存在——不是另立的 bottom 对象，就是没有
@@ -119,12 +123,21 @@ struct SimValue {
         return s;
     }
 
+    /// 动态构造的字符串（StringBuilder.toString 等）：身份不可判，不参与
+    /// if_acmpeq 裁决。
     static SimValue knownStr(std::string text) {
         SimValue s;
         s.type = ValType::Ref;
         s.known = true;
         s.ref.kind = RefPayload::Kind::Str;
         s.ref.str = std::move(text);
+        return s;
+    }
+
+    /// ldc 字面量：常量池 intern 事实，同内容即同一对象，引用相等可判。
+    static SimValue internedStr(std::string text) {
+        SimValue s = knownStr(std::move(text));
+        s.ref.interned = true;
         return s;
     }
 

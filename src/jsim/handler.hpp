@@ -13,10 +13,11 @@ namespace jsim {
 /// Branch：条件分支，操作数全 Known 单边裁决，否则 Bail{NotConcrete} 或分支接管。
 /// Switch：tableswitch/lookupswitch，同 Branch 纪律。
 /// Alloc：new 系，只走分配脚手架注册面，未注册 Bail。
-/// Array：数组指令（newarray/iaload/iastore/arraylength），JVM 指令集语义，
-///        走会话堆上的 int 数组脚手架（I64/F64 数组不在 MVP 面）。
-/// Field：getstatic/putstatic，走 Session.statics 键值面；未初始化字段按类型
-///        传播压 Unknown。
+/// Array：数组指令（newarray/anewarray/multianewarray + load/store/length），
+///        JVM 指令集语义（不涉及任何 JDK 类）：按元素宽度与符号性建在会话堆上
+///        （[B 有符号、[Z/[C 无符号）；multianewarray 全维分配。
+/// Field：getstatic/putstatic/getfield/putfield。接管（Session.fieldMocks）优先；
+///        未命中走会话存贮底座（statics / 堆 fields），缺项按类型传播压 Unknown。
 /// BoundaryCall：invoke 系，核心不自带继续语义，只走接管面，未注册即 Bail。
 /// Control：无条件 pc 转移（goto）。
 /// Return：弹栈收尾，产生 Completed。
