@@ -42,6 +42,20 @@ inline float bitsToFloat(u32 bits) {
     return v;
 }
 
+/// F64 的位型搬运：常量池里的 double 是位型，不是数值。
+inline u64 doubleToBits(f64 v) {
+    u64 bits = 0;
+    static_assert(sizeof(double) == sizeof(u64), "double 必须 64 位");
+    std::memcpy(&bits, &v, sizeof(bits));
+    return bits;
+}
+
+inline f64 bitsToDouble(u64 bits) {
+    f64 v = 0.0;
+    std::memcpy(&v, &bits, sizeof(v));
+    return v;
+}
+
 /// 引用载荷的已知形态。null 是已知值（设计 D3），不是未知。
 struct RefPayload {
     enum class Kind : u8 {

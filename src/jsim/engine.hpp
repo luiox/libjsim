@@ -523,6 +523,12 @@ private:
             if (entry.kind == CpEntry::Kind::Long) {
                 return nextStep(SimValue::knownI64(entry.longValue));
             }
+            if (entry.kind == CpEntry::Kind::Float) {
+                return nextStep(SimValue::knownF32(bitsToFloat(static_cast<u32>(entry.intValue))));
+            }
+            if (entry.kind == CpEntry::Kind::Double) {
+                return nextStep(SimValue::knownF64(bitsToDouble(static_cast<u64>(entry.longValue))));
+            }
             if (entry.kind == CpEntry::Kind::Class) {
                 return nextStep(SimValue::knownObj(session_->classObjectOf(entry.className)));
             }

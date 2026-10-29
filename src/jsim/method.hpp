@@ -185,19 +185,21 @@ constexpr u8 IfNull = 0xc6;
 constexpr u8 IfNonNull = 0xc7;
 } // namespace op
 
-/// 常量池条目。MVP 收 int / long / string / class 四类（class 常量供
-/// `ldc Type` 用——BSM 里 `getAnnotation(Ljava/lang/Class;)` 的实参就是它）。
+/// 常量池条目。MVP 收 int / long / float / double / string / class 六类。
+/// 浮点走位型（intValue/longValue 存 bits），与 SimValue 的 F32 载荷口径一致。
 struct CpEntry {
     enum class Kind : u8 {
         Int,
         Long,
+        Float,
+        Double,
         Str,
         Class,
     };
 
     Kind kind = Kind::Int;
-    i32 intValue = 0;
-    i64 longValue = 0;
+    i32 intValue = 0;   // Int；Float 时是 floatToBits 位型
+    i64 longValue = 0;  // Long；Double 时是位型
     std::string strValue;
     std::string className; // Kind == Class 时有效：内部名，不带 L;
 };
