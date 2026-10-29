@@ -1,6 +1,6 @@
 # libjsim 设计稿
 
-状态：设计草案 v0.2（2026-10-28）。v0.1 的三处结构性修正：默认 handler 只算类型不估值、核心只跑一个方法、语义注入全部下放扩展包。
+状态：设计草案 v0.3（2026-10-29）。v0.1 的三处结构性修正：默认 handler 只算类型不估值、核心只跑一个方法、语义注入全部下放扩展包。v0.3 落地扩展面缺口（字段接管、分支接管收帧、结构化观测与断点、栈平衡开关）并收紧三处口径（Str 身份位、multianewarray 全维分配、num 解析越界），见 §12。
 
 ## 1. 定位
 
@@ -42,10 +42,10 @@ SimValue 是封闭 tagged union，三个成员：类型、是否已知、值。
 ```
 Type       = I32 | I64 | F32 | F64 | Ref
 Payload    = i64 | f64 | RefPayload        // 仅 Known 时存在
-RefPayload = Null | Str(Utf8String) | Obj(allocId)
+RefPayload = Null | Str(Utf8String, interned) | Obj(allocId)
 ```
 
-类型是槽位的静态事实，决定 cat1 / cat2 与槽位形状；值是动态事实。Unknown(I32) 仍是 I32，只是没有值。null 是已知值不是未知。字符串载荷内联进 value（Utf8String）；对象载荷只背 allocId，内容在会话堆。
+类型是槽位的静态事实，决定 cat1 / cat2 与槽位形状；值是动态事实。Unknown(I32) 仍是 I32，只是没有值。null 是已知值不是未知。字符串载荷内联进 value（Utf8String）；对象载荷只背 allocId，内容在会话堆。Str 的 interned 是身份事实（不是诊断，不违反 D2）：ldc 字面量为真——常量池 intern 保证同内容字面量同一对象，引用相等可判；动态构造的字符串（StringBuilder.toString 产物等）为假——真 JVM 里是新对象，模型没有第二身份键，身份不可判，`if_acmpeq` 走分支接管三态而不是按内容判同。
 
 ### 3.2 运算规则
 
@@ -71,7 +71,7 @@ RefPayload = Null | Str(Utf8String) | Obj(allocId)
 
 (1) 值内指令（常量装载、算术、转换、栈操作、数组长度等）：操作数全 Known 时算值写回；否则弹出操作数、压入正确类型的 Unknown，继续执行。用户由此可以跑通「直线段 + 关心点」的片段，无关指令不阻断执行。
 
-(2) 边界指令（invoke 系、new、字段访问、indy、monitor、athrow）：核心不自带继续语义。先查接管注册，命中则由接管方给语义；未命中一律 Bail，原因码区分 UnsupportedCall / UnsupportedAlloc / FieldAbsent 等。边界指令的语义只能来自注入，框架绝不编造。
+(2) 边界指令（invoke 系、new、indy、monitor、athrow）：核心不自带继续语义。先查接管注册，命中则由接管方给语义；未命中一律 Bail，原因码区分 UnsupportedCall / UnsupportedAlloc 等。字段访问单列（v0.3 定稿）：接管优先（§6 字段接管），未命中走会话存贮底座——静态字段 Session.statics、实例字段 HeapObj.fields，缺项按字段类型传播 Unknown（字段没被赋值过是常态，不是失败）；Known null 接收者的 getfield/putfield 按 NPE 口径 Bail，与整数除零同一纪律。边界指令的语义只能来自注入，框架绝不编造。
 
 这条契约的推论：核心不存在「尚未实现的内建」这种状态。语义要么被注入，要么 Bail，不存在第三种半成品状态。
 
@@ -79,11 +79,11 @@ RefPayload = Null | Str(Utf8String) | Obj(allocId)
 
 一个 sim 实例绑定一个方法。构造参数：方法体（libjbc CodeUnit）、入口 pc、预填帧（栈与局部变量任意槽位，Known 或 Unknown）、限制配置（步数上限、栈平衡开关）。
 
-引擎只做五件事：按 pc 取指令、查 handler、维护槽位形状与 cat2 记账、推进或跳转、熔断与 Bail。不做 verifier 式数据流合并；栈平衡检查开启时只做合并点的深度与类型一致性校验，关闭时引擎信任预填。
+引擎只做五件事：按 pc 取指令、查 handler、维护槽位形状与 cat2 记账、推进或跳转、熔断与 Bail。不做 verifier 式数据流合并；栈平衡检查开启时（Limits.checkBalance）只做合并点的深度与类型一致性校验——同 pc 二次到达栈形不一致即 Bail{StackBroken}，关闭时引擎信任预填。两个便利入口已落地：runEntry 方法入口起步（栈平衡默认开）与 runRegion 区间起步（栈平衡默认关，容忍预填栈与域外出口——越过方法尾按 Completed(void) 收尾）。两者共用同一引擎，只是预填与开关的预设。
 
 跨方法一律不递归。调用点经接管面处理：扩展包的 mock、用户注册的接管函数、或 Bail。解密链跨多个方法时，调用方在 profile 层编排：取实参、跑被调方法的 sim、把结果作为接管返回值喂回调用方 sim。这个限制换来的是核心没有调用栈、没有递归深度问题、没有类层次解析、没有 clinit 自动链，实例轻到可以按调用点批量构造。
 
-便利入口按用途分两个封装：方法入口起步（栈平衡默认开）与任意点区间起步（栈平衡默认关，容忍预填栈与域外出口）。两者共用同一引擎，只是预填与开关的预设。
+便利入口按用途分两个封装：方法入口起步（栈平衡默认开）与任意点区间起步（栈平衡默认关，容忍预填栈与域外出口）。两者共用同一引擎，只是预填与开关的预设（v0.3 已实现：runEntry / runRegion）。
 
 ## 6. 接管面
 
@@ -93,11 +93,11 @@ RefPayload = Null | Str(Utf8String) | Obj(allocId)
 |---|---|---|---|
 | opcode handler | 指令派发（**先于**效应表） | 替换该指令语义，收完整进入帧 | opcode 槽位 |
 | 调用接管 | invoke 解析接管后 | 返回 Known 值、写堆、或 Bail | owner+name+desc，按调用点注册优先于按签名 |
-| 调用兜底解析 | 静态键都查不到时 | 按**接收者对象**现场决定语义，或返回 nullptr 放行 | 收完整帧，可窥视接收者后认领/不认领 |
-| 字段接管 | getfield/getstatic/put 系 | 注入值或记录 | owner+name+desc |
-| 分支接管 | 条件求值 Unknown 时 | 三态裁决 Taken / NotTaken / Bail | opcode、pc |
-| 堆形态 | new / newarray | 注册 allocId 背后的对象变体与行为 | 类名 |
-| 观测 | 每步 / Bail | trace、断点、帧快照 | 全量或过滤 |
+| 调用兜底解析 | 静态键都查不到时 | 按**接收者对象**现场决定语义，或返回 nullptr 放行 | 收完整帧，可窥视接收者后认领/不认领；解析链按注册序逐个问，单槽不独占 |
+| 字段接管 | getstatic/getfield/putstatic/putfield | 注入值或记录；get 系返回值按描述符定型压栈，put 系自行弹栈 | owner+name+desc，命中优先于存贮底座 |
+| 分支接管 | 条件不具体时（值 Unknown 或引用身份不可判） | 三态裁决 Taken / NotTaken / Bail；收完整进入帧，操作数由引擎裁决后统一弹出 | pc |
+| 堆形态 | new | 注册 allocId 背后的初始载荷 | 类名 |
+| 观测 | 每步 / Bail | stepObservers（指令前结构化只读视图）、trace（步后文本）、bailObserver（Bail 现场）、RunResult 终止帧快照、Limits.stopAtPc 断点熔断（LimitHit 语义，快照灌回即续跑） | 全量或观测方自过滤 |
 
 handler 与接管的签名统一收完整进入帧：栈、局部变量、pc、方法体只读视图、会话引用。引擎不做预弹栈，取数由接管方经受检栈操作完成。这条约束来自 mjbase 的教训：只给产点不给栈的钩子，会迫使用户做两趟探测注入。
 
@@ -138,7 +138,7 @@ dasho profile 的骨架：调用点形态多样，不做形态匹配，直接对
 
 (3) 判稳件：多 seed 一致性与明文合法性校验做成库内断言件，profile 直接调用。
 
-(4) 构建：delete-then-rebuild 门，测试产物进项目 test 目录。
+(4) 构建：delete-then-rebuild 门，测试产物进项目 test 目录。xmake 按包独立 target（jsim / jsim-str / jsim-num / jsim-reflect / jsim-indy / jsim-demo / jsim-test），扩展包互不依赖。
 
 核心零外部依赖（纯 std 头文件）。jbc 会话面（CodeUnit → jsim::Method）与
 MUTF-8 字符串面属边界胶水，由消费方仓自备（桥不在本仓）；libjstr 仅扩展包
@@ -176,6 +176,26 @@ invokedynamic（Bail，语义由 jsim-indy 组合）、异常表派发（athrow 
 **(4) 栈指令的 cat2 形态。** `pop2`/`dup2`/`dup_x2`/`dup2_x1`/`dup2_x2` 在 JVMS §6.5 里各有 2~4 种形，首版只做了全 cat1 那一形，`pop2` 还错发成 `pop`。现在按形分流：本模型一个值一个条目，cat2 只影响「弹几个条目」。
 
 同时补齐了：`dup_x2 = 0x5b` 常量错（首版误作 0x5d，那是 `dup2_x1`）、opcode 常量补全到 202 条、约 190 条效应表、`ldc` 的 class 常量与 `Session::classObjectOf`（`ldc` 类常量与 `Class.forName` 必须同一对象，否则 `if_acmpeq` 假性失败）、数组面按元素宽度与符号性建模（`[B` 有符号、`[Z`/`[C` 无符号）、实例字段面（`HeapObj.fields`）、`getfield`/`putfield`、浮点与饱和转换、整数除零明确 Bail（需异常派发，不编造商）。
+
+### v0.3（2026-10-29）：扩展面补齐与口径收紧
+
+架构审查结论：框架没有向执行完备漂移（核心仍单方法、零 JDK 语义、扩展包克制），偏离集中在**扩展面本身没做完**。本版按 §6/§5 的原文兑现欠账，并收紧三处顺嘴实现的口径。
+
+**(5) 字段接管落地。** §6 表中承诺的字段接管（owner+name+desc 过滤）首版无实现面，用户只能整条替换 opcode 且必须自己重写弹压语义。现在 `Session.fieldMocks` 落地：get 系返回值由引擎按描述符定型压栈，put 系由接管方自行弹栈；命中优先于存贮底座。§4 原文把字段访问归入「未命中一律 Bail」的边界清单并点名 FieldAbsent 原因码，与 §12 已挂账的「缺项即 Unknown」互相矛盾——v0.3 定稿为后者（缺项是常态不是失败），§4 已同步改写；getfield/putfield 的 Known null 接收者按 NPE 口径 Bail{BadOperand}，与整数除零同一纪律。
+
+**(6) 分支接管收完整帧。** 首版 `executeBranch` 先弹操作数再查接管，`BranchHook` 只收 pc——违反 §6 红线（「引擎不做预弹栈」，正是 mjbase 的教训原文），裁决方既看不到条件操作数、操作数也已被丢弃。现改为窥视判定、裁决后统一弹出，签名收 Frame。
+
+**(7) 观测面结构化。** 首版只有单槽文本 trace（toDisplay 渲染串，拿不到 SimValue）。现在补齐：`stepObservers`（每条指令执行前的结构化只读视图：栈、局部变量、方法体、会话）、`bailObserver`（Bail 现场回调）、`RunResult.finalStack/finalLocals`（三种终态都带的终止帧快照）、`Limits.stopAtPc`（断点熔断，LimitHit 语义，快照灌回 Prefill 即续跑）。
+
+**(8) 启动面补齐。** D4 的「栈平衡检查可关」首版是「不存在」而非「可关」。现在 `Limits.checkBalance` 落地（同 pc 二次到达深度或类型序列不一致即 Bail{StackBroken}，向量按 pc 索引，不做数据流合并）；两个便利入口 `runEntry`（默认开）/`runRegion`（默认关、tolerateOffEnd 容忍域外出口）成对落地。
+
+**(9) Str 身份位。** 首版 `sameRef` 对所有 Str 载荷按内容判等，把 `sb.toString() == 字面量` 假性折真（真 JVM 里 toString 产物是新对象，恒 false）——正是失败面「不静默走错」要防的事。现在 `RefPayload.Str` 带 interned 位：ldc 字面量按常量池 intern 事实可判同；动态构造字符串身份不可判，`if_acmpeq` 走分支接管三态（compareRef 三态 Same/Diff/Unknown）。
+
+**(10) multianewarray 全维分配。** 首版只建最外层、内层静默成 null，并引 D9（不跨方法递归）为据——数组嵌套是数据递归，不是方法递归，依据不成立。现在全部维度已知即按 JVMS 逐层建满；内层长度未知时最外层元素挂 Unknown(Ref)（内层确实存在，指向不可知，不猜 null）；已知负长度按 NegativeArraySizeException 口径 Bail。
+
+**(11) jsim-num 解析越界。** `Integer.parseInt("2147483648")` 首版静默回绕（注释自称「按 JVM 口径回绕」——那是算术口径，解析口径在 JDK 是 NumberFormatException）。现在越界与位数溢出一律解析失败 Bail，对齐本包「不编造 0」的契约。
+
+**(12) 工程面。** 测试层落地（test/，90 项断言：值代数、逐类 handler、五个完备面、扩展包每条接管一测）；xmake 按包独立 target（jsim-str/num/reflect/indy）；demo 移除未消费的 libjstr 依赖；MethodBuilder 补 if_acmpeq 族与 multianewarray 助手。
 
 ## 附录 A：存量证据
 

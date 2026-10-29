@@ -456,6 +456,83 @@ void scenario7() {
     printResult(Sim(buildMetaReader(), empty).run(0, Prefill{}, Limits{64}));
 }
 
+/// 场景 9 · 补齐的扩展面：字段接管 / 断点熔断与帧快照 / 合并点校验。
+/// 这三样是 §6/§5 承诺但首版缺位的注册点：字段面只能整条替换 opcode、分支之外
+/// 无结构化观测、栈平衡开关不存在。现在各自有自己的口子。
+void scenario9() {
+    std::printf("\n── 场景 9 · 字段接管 + 断点熔断 + 合并点校验 ──\n");
+
+    // 字段接管：getstatic 注入配置值、putstatic 记录写入，不碰 Session.statics。
+    Session cfg;
+    cfg.fieldMocks["cfg.magicI"] = [](Frame&) -> Result<SimValue, Bail> {
+        return Result<SimValue, Bail>::ok(SimValue::knownI32(42));
+    };
+    i64 wrote = 0;
+    cfg.fieldMocks["cfg.flagI"] = [&wrote](Frame& frame) -> Result<SimValue, Bail> {
+        Result<SimValue, Bail> v = frame.popChecked();
+        if (v.isOk()) wrote = v.value().intBits;
+        return v;
+    };
+    Method reader = MethodBuilder("readCfg", "()I", 0)
+                        .getStatic("cfg", "magic", "I", ValType::I32)
+                        .ireturn()
+                        .build();
+    Method writer = MethodBuilder("writeCfg", "()V", 0)
+                        .iconst(7)
+                        .putStatic("cfg", "flag", "I", ValType::I32)
+                        .vreturn()
+                        .build();
+    std::printf("getstatic 接管注入：\n");
+    printResult(Sim(reader, cfg).runEntry(Prefill{}));
+    printResult(Sim(writer, cfg).runEntry(Prefill{}));
+    std::printf("putstatic 接管记录到写入值：%lld\n", static_cast<long long>(wrote));
+
+    // 断点熔断：iadd 前停，帧快照在 result 里；快照灌回即续跑。
+    Method add = MethodBuilder("add3", "(I)I", 1)
+                     .iload(0)  // 0
+                     .ldcI(3)   // 1
+                     .iadd()    // 2
+                     .ireturn() // 3
+                     .build();
+    Session obs;
+    Limits bp;
+    bp.maxSteps = 64;
+    bp.stopAtPc = 2;
+    Prefill arg;
+    arg.locals = {SimValue::knownI32(1)};
+    RunResult stopped = Sim(add, obs).run(0, std::move(arg), bp);
+    std::printf("断点 @pc2 熔断：");
+    printResult(stopped);
+    Prefill resume;
+    resume.stack = stopped.finalStack;
+    resume.locals = stopped.finalLocals;
+    std::printf("快照灌回复跑：");
+    printResult(Sim(add, obs).runRegion(2, std::move(resume)));
+
+    // 合并点校验：pc2 二达栈形不一致，runEntry Bail{StackBroken}；
+    // raw run（默认不校验）同一方法只撞步数熔断。
+    Method wobbly = MethodBuilder("wobbly", "()V", 0)
+                        .nop()     // 0
+                        .nop()     // 1
+                        .ldcI(0)   // 2
+                        .ifEq(5)   // 3
+                        .nop()     // 4
+                        .iconst(9) // 5
+                        .gotoPc(2) // 6
+                        .build();
+    Prefill seeded;
+    seeded.stack = {SimValue::knownI32(1)};
+    Limits strict;
+    strict.maxSteps = 64;
+    strict.checkBalance = true;
+    std::printf("栈形不一致 + 校验开：");
+    printResult(Sim(wobbly, obs).run(2, std::move(seeded), strict));
+    Prefill seeded2;
+    seeded2.stack = {SimValue::knownI32(1)};
+    std::printf("同一方法 + 校验关：");
+    printResult(Sim(wobbly, obs).run(2, std::move(seeded2), Limits{64}));
+}
+
 } // namespace
 
 int main() {
@@ -468,5 +545,6 @@ int main() {
     scenario6();
     scenario7();
     scenario8();
+    scenario9();
     return 0;
 }
