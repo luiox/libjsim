@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
 #include <string>
 
 namespace jsim {
@@ -24,6 +25,22 @@ enum class ValType : u8 {
     F64,
     Ref,
 };
+
+/// F32 的位型搬运。JVM 的 float 值集按位型定义（含 NaN 规范化的历史包袱），
+/// 所以 F32 载荷一律走位型而不是 C++ float——位型相等即值相等，不必碰
+/// NaN 的坑。这里是唯一的转换点。
+inline u32 floatToBits(float v) {
+    u32 bits = 0;
+    static_assert(sizeof(float) == sizeof(u32), "float 必须 32 位");
+    std::memcpy(&bits, &v, sizeof(bits));
+    return bits;
+}
+
+inline float bitsToFloat(u32 bits) {
+    float v = 0.0f;
+    std::memcpy(&v, &bits, sizeof(v));
+    return v;
+}
 
 /// 引用载荷的已知形态。null 是已知值（设计 D3），不是未知。
 struct RefPayload {
@@ -61,6 +78,23 @@ struct SimValue {
         s.type = ValType::I64;
         s.known = true;
         s.intBits = v;
+        return s;
+    }
+
+    /// F32 已知值：载荷是 floatToBits 位型，不存 C++ float（见 floatToBits 注释）。
+    static SimValue knownF32(float v) {
+        SimValue s;
+        s.type = ValType::F32;
+        s.known = true;
+        s.intBits = static_cast<i64>(static_cast<u32>(floatToBits(v)));
+        return s;
+    }
+
+    static SimValue knownF64(f64 v) {
+        SimValue s;
+        s.type = ValType::F64;
+        s.known = true;
+        s.realValue = v;
         return s;
     }
 
@@ -106,6 +140,22 @@ struct SimValue {
     u64 asU64() const {
         return static_cast<std::uint64_t>(intBits);
     }
+
+    /// F32 取回 float：只有位型载荷，没有第二份真值。
+    float asF32() const {
+        return bitsToFloat(asU32());
+    }
+
+    /// F64 取回 double：F64 直接存真值，不经位型。
+    f64 asF64() const {
+        return realValue;
+    }
+
+    /// cat2 判定：I64/F64 在 JVM 帧里占两个槽位，栈指令（pop2/dup2/dup2_x*）
+    /// 的分支形态由它决定。本模型一个值一个条目，槽位宽度只体现在这里。
+    bool isCat2() const {
+        return type == ValType::I64 || type == ValType::F64;
+    }
 };
 
 /// 观测面用的展示形。诊断属于观测，不属于 value 本身（设计 D2）。
@@ -125,7 +175,7 @@ inline std::string toDisplay(const SimValue& v) {
     case ValType::I64:
         return "Known(I64, " + std::to_string(v.intBits) + ")";
     case ValType::F32:
-        return "Known(F32)";
+        return "Known(F32, " + std::to_string(v.asF32()) + ")";
     case ValType::F64:
         return "Known(F64, " + std::to_string(v.realValue) + ")";
     case ValType::Ref:

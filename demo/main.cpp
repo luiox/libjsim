@@ -4,6 +4,8 @@
 #include <cstdio>
 
 #include "jsim/engine.hpp"
+#include "jsim/num.hpp"
+#include "jsim/reflect.hpp"
 #include "jsim/str.hpp"
 
 using namespace jsim;
@@ -281,6 +283,179 @@ void scenario6() {
     printResult(Sim(m, session).run(13, Prefill{}, Limits{64}));
 }
 
+/// 与 Grunt2 的 encrypt 同口径：逐码元 xor 后当 char 写回。
+std::string xorEncrypt(const std::string& plain, i32 key) {
+    std::string out;
+    for (char ch : plain) {
+        str::appendCodeUnit(out, static_cast<i32>(ch) ^ key);
+    }
+    return out;
+}
+
+/// BSM 的前半段（照 Grunt2 InvokeDynamicTransformer.createHeavyBootstrap 缩编）：
+/// Class.forName → getAnnotation → mv >= 100 → parseInt(d2[0]) % 59557 == 0 → d1[0]。
+/// 常量 59557 与 mv 下限 100 都是混淆器的真实取值，不是编的。
+Method buildMetaReader() {
+    return MethodBuilder("meta", "()Ljava/lang/String;", 3)
+        .ldcStr("dev.realme.xD")                                            // 0
+        .invoke("java/lang/Class", "forName", "(Ljava/lang/String;)Ljava/lang/Class;",
+                ValType::Ref)                                               // 1
+        .astore(0)                                                          // 2
+        .aload(0)                                                           // 3
+        .ldcClass("dev/realme/Booger")                                      // 4
+        .invokeVirtual("java/lang/Class", "getAnnotation",
+                       "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;",
+                       ValType::Ref)                                        // 5
+        .astore(1)                                                          // 6
+        .aload(1)                                                           // 7
+        .invokeInterface("dev/realme/Booger", "mv", "()I", ValType::I32)     // 8
+        .iconst(100)                                                        // 9
+        .ifIcmpge(13)                                                       // 10 版本下限
+        .aconstNull()                                                       // 11
+        .areturn()                                                          // 12
+        .aload(1)                                                           // 13
+        .invokeInterface("dev/realme/Booger", "d2", "()[Ljava/lang/String;", ValType::Ref) // 14
+        .iconst(0)                                                          // 15
+        .aaload()                                                           // 16
+        .invoke("java/lang/Integer", "parseInt", "(Ljava/lang/String;)I", ValType::I32) // 17
+        .ldcI(59557)                                                        // 18
+        .irem()                                                             // 19
+        .ifNe(26)                                                           // 20 键不匹配 → 失败块
+        .aload(1)                                                           // 21
+        .invokeInterface("dev/realme/Booger", "d1", "()[Ljava/lang/String;", ValType::Ref) // 22
+        .iconst(0)                                                          // 23
+        .aaload()                                                           // 24
+        .areturn()                                                          // 25
+        .aconstNull()                                                       // 26 失败块
+        .areturn()                                                          // 27
+        .build();
+}
+
+/// 同类里的 decrypt(String)：与 createDecryptMethod 逐条对齐（key 走 LDC）。
+Method buildClassDecryptor(i32 key) {
+    return MethodBuilder("decrypt", "(Ljava/lang/String;)Ljava/lang/String;", 3)
+        .newInst("java/lang/StringBuilder")                                  // 0
+        .dup()                                                               // 1
+        .invokeSpecial("java/lang/StringBuilder", "<init>", "()V")            // 2
+        .astore(1)                                                           // 3
+        .iconst(0)                                                           // 4
+        .istore(2)                                                           // 5
+        .gotoPc(17)                                                          // 6
+        .aload(1)                                                            // 7 循环体
+        .aload(0)                                                            // 8
+        .iload(2)                                                            // 9
+        .invokeVirtual("java/lang/String", "charAt", "(I)C", ValType::I32)    // 10
+        .ldcI(key)                                                           // 11
+        .ixor()                                                              // 12
+        .i2c()                                                               // 13
+        .invokeVirtual("java/lang/StringBuilder", "append", "(C)Ljava/lang/StringBuilder;",
+                       ValType::Ref)                                         // 14
+        .pop()                                                               // 15
+        .iinc(2, 1)                                                          // 16
+        .iload(2)                                                            // 17 循环头
+        .aload(0)                                                            // 18
+        .invokeVirtual("java/lang/String", "length", "()I", ValType::I32)     // 19
+        .ifIcmplt(7)                                                         // 20
+        .aload(1)                                                            // 21
+        .invokeVirtual("java/lang/StringBuilder", "toString", "()Ljava/lang/String;",
+                       ValType::Ref)                                         // 22
+        .areturn()                                                           // 23
+        .build();
+}
+
+/// 场景 8 · 指令接管：instanceof 的答案取决于类型层次，核心不认层次（默认压
+/// Unknown），profile 认层次时按 opcode 整条替换。这是「表里有、但默认语义不够」
+/// 的那条路——接管优先于效应表，不需要等核心改。
+void scenario8() {
+    std::printf("\n── 场景 8 · 指令接管：instanceof 的默认 Unknown 与 profile 裁决 ──\n");
+
+    Method m = MethodBuilder("isString", "(Ljava/lang/Object;)I", 1)
+                   .aload(0)
+                   .raw(op::InstanceOf)
+                   .ireturn()
+                   .build();
+
+    Session plain;
+    Prefill arg;
+    arg.locals = {SimValue::knownObj(1)};
+    std::printf("未接管（核心只认类型）：\n");
+    printResult(Sim(m, plain).run(0, std::move(arg), Limits{16}));
+
+    Session profiled;
+    profiled.heap[1] = HeapObj{"java/lang/String", {}, {}, {}, {}};
+    profiled.opcodeHandlers[op::InstanceOf] = [](Frame& frame) -> Result<OpOutcome, Bail> {
+        Result<SimValue, Bail> recv = frame.popChecked();
+        if (!recv.isOk()) return Result<OpOutcome, Bail>::err(recv.error());
+        bool isString = false;
+        if (recv.value().known && recv.value().ref.kind == RefPayload::Kind::Obj) {
+            auto it = frame.session().heap.find(recv.value().ref.objId);
+            if (it != frame.session().heap.end()) {
+                isString = it->second.className == "java/lang/String";
+            }
+        }
+        frame.push(SimValue::knownI32(isString ? 1 : 0));
+        OpOutcome outcome; // nextPc 默认 = 顺序推进
+        return Result<OpOutcome, Bail>::ok(outcome);
+    };
+    Prefill arg2;
+    arg2.locals = {SimValue::knownObj(1)};
+    std::printf("注册指令接管后（堆对象 className = java/lang/String）：\n");
+    printResult(Sim(m, profiled).run(0, std::move(arg2), Limits{16}));
+}
+
+/// 场景 7：把「读注解」和「跑解密」串成构建期去混淆的真实编排。
+/// 两个扩展包各自 install 一行，核心对注解、String、Integer 一无所知。
+void scenario7() {
+    std::printf("\n── 场景 7 · 注解驱动的字符串解密（jsim-reflect + jsim-str + jsim-num）──\n");
+    std::printf("元数据由 provider 灌入，扩展包不解析 class 文件；解密体逐条对齐\n");
+    std::printf("Grunt2 的 createDecryptMethod。\n");
+
+    const i32 key = 1503;
+    const std::string plain = "dev/realme/xD";
+    const std::string cipher = xorEncrypt(plain, key);
+
+    reflect::ClassMeta meta;
+    meta.internalName = "dev/realme/xD";
+    reflect::AnnotationData anno;
+    anno.type = "dev/realme/Booger";
+    anno.elements.push_back({"mv", reflect::AnnoValue::int32(100)});
+    anno.elements.push_back({"d1", reflect::AnnoValue::textArray({cipher})});
+    anno.elements.push_back({"d2", reflect::AnnoValue::textArray({"59557"})});
+    meta.annotations.push_back(std::move(anno));
+
+    Session session;
+    str::install(session);
+    num::install(session);
+    reflect::install(session, [&meta](const std::string& name) -> const reflect::ClassMeta* {
+        return name == meta.internalName ? &meta : nullptr;
+    });
+
+    RunResult got = Sim(buildMetaReader(), session).run(0, Prefill{}, Limits{64});
+    std::printf("forName → getAnnotation → mv 校验 → parseInt(d2[0]) %% 59557 → d1[0]：\n");
+    printResult(got);
+    if (got.kind != RunResult::Kind::Completed || !got.hasReturnValue) return;
+
+    Prefill arg;
+    arg.locals = {got.returnValue};
+    RunResult back = Sim(buildClassDecryptor(key), session).run(0, std::move(arg), Limits{512});
+    std::printf("把密文喂回 decrypt(String)（key=%d）：\n", key);
+    printResult(back);
+    const bool restored = back.kind == RunResult::Kind::Completed && back.hasReturnValue &&
+                          back.returnValue.known &&
+                          back.returnValue.ref.kind == RefPayload::Kind::Str &&
+                          back.returnValue.ref.str == plain;
+    std::printf("还原出明文 \"%s\"：%s\n", plain.c_str(), restored ? "是" : "否");
+
+    // 元数据缺失的失败面：provider 说不认识这个类，getAnnotation 返回 null，
+    // 随后的 invokeinterface 认不出接收者 → 交回核心 Bail，不编造 mv 值。
+    Session empty;
+    str::install(empty);
+    num::install(empty);
+    reflect::install(empty, [](const std::string&) -> const reflect::ClassMeta* { return nullptr; });
+    std::printf("provider 交不出元数据时：\n");
+    printResult(Sim(buildMetaReader(), empty).run(0, Prefill{}, Limits{64}));
+}
+
 } // namespace
 
 int main() {
@@ -291,5 +466,7 @@ int main() {
     scenario4();
     scenario5();
     scenario6();
+    scenario7();
+    scenario8();
     return 0;
 }

@@ -91,14 +91,17 @@ RefPayload = Null | Str(Utf8String) | Obj(allocId)
 
 | 注册项 | 触发 | 语义 | 过滤器 |
 |---|---|---|---|
-| opcode handler | 指令派发 | 替换该指令语义，收完整进入帧 | opcode 槽位 |
+| opcode handler | 指令派发（**先于**效应表） | 替换该指令语义，收完整进入帧 | opcode 槽位 |
 | 调用接管 | invoke 解析接管后 | 返回 Known 值、写堆、或 Bail | owner+name+desc，按调用点注册优先于按签名 |
+| 调用兜底解析 | 静态键都查不到时 | 按**接收者对象**现场决定语义，或返回 nullptr 放行 | 收完整帧，可窥视接收者后认领/不认领 |
 | 字段接管 | getfield/getstatic/put 系 | 注入值或记录 | owner+name+desc |
 | 分支接管 | 条件求值 Unknown 时 | 三态裁决 Taken / NotTaken / Bail | opcode、pc |
 | 堆形态 | new / newarray | 注册 allocId 背后的对象变体与行为 | 类名 |
 | 观测 | 每步 / Bail | trace、断点、帧快照 | 全量或过滤 |
 
 handler 与接管的签名统一收完整进入帧：栈、局部变量、pc、方法体只读视图、会话引用。引擎不做预弹栈，取数由接管方经受检栈操作完成。这条约束来自 mjbase 的教训：只给产点不给栈的钩子，会迫使用户做两趟探测注入。
+
+**兜底解析**是为「方法名就是数据」的调用面留的口子：注解元素访问器（`d1()`）、getter 家族、反射代理，语义由接收者决定，静态签名键永远匹配不全。解析方拿到帧后自己窥视接收者，认领才返回 mock，不认领返回 nullptr 交回核心 Bail——不允许把「缺环境」静默吞成 Unknown。
 
 ## 7. 扩展包
 
@@ -107,13 +110,17 @@ handler 与接管的签名统一收完整进入帧：栈、局部变量、pc、�
 | 包 | 内容 |
 |---|---|
 | jsim-str | String 家族与 StringBuilder/StringBuffer 的调用接管，char[] 数组行为，字符串构造两阶段 |
-| jsim-math | Math 系与整型装箱拆箱的调用接管 |
+| jsim-num | Integer/Long 的装箱拆箱与十进制解析（解析失败明确 Bail，不编造 0） |
+| jsim-reflect | Class.forName / getAnnotation / 注解元素访问器；元数据走 provider 注入，包内不解析 class 文件 |
+| jsim-math | Math 系与浮点辅助函数的调用接管 |
 | jsim-random | java/util/Random 的 48 位 LCG 复刻 |
 | jsim-stacktrace | getStackTrace 假栈帧构造 |
 | jsim-indy | invokedynamic 的 bootstrap 脚手架，供用户组合特定调用点形态 |
 | jsim-jni | 本地方法接管的接缝与常用 mock 骨架 |
 
 包内每条接管带独立测试。包之间不互相依赖，组合发生在用户侧。框架不内置任何混淆器知识；jsim-stacktrace 虽然因解密场景而设，但内容是 Thread.getStackTrace 的 JDK 语义，归入 JDK 面扩展包。
+
+`jsim-reflect` 的边界值得单说：它**不解析 class 文件**。`ClassMeta`（类名 + 注解 + 元素值）由 provider 灌进来，libjbc 桥、JSON 表、手写脚本都从同一个口进。这样反射面既不依赖容器格式，也不把「怎么读注解」写死成一种实现。
 
 ## 8. profile 层
 
@@ -145,7 +152,8 @@ libjsim/
   docs/design.md
   src/jsim/        // 核心：value、session（堆+allocId+限制）、frame、
                    //       handler（含栈效应表）、接管面、engine、bail、trace
-  ext/             // 扩展包：str、math、random、stacktrace、indy、jni
+  ext/jsim/        // 扩展包：str、num、reflect、math、random、stacktrace、indy、jni
+  demo/            // 逐场景可执行样例（类型传播 / 接管面 / 区间 / 解密 / 反射）
   test/            // 值代数、逐 handler、恒等式对拍、扩展包接管测试
 ```
 
@@ -154,6 +162,20 @@ libjsim/
 ## 11. v1 不做
 
 invokedynamic（Bail，语义由 jsim-indy 组合）、异常表派发（athrow 与区间模式本就绕开帧重算，v1 直接 Bail）、多线程与 monitor（monitor 指令按类型传播为 Unknown）、类初始化链（字段值由预填或接管注入）、finalize 与 GC、JDK 9+ indy 字符串拼接（Bail）、跨方法递归（永久不做，见 D9）、浮点 strict/loose 模式差异（单点口径不分叉）。
+
+## 12. 实现现状：核心补丁记录
+
+设计稿与首版代码之间曾有四处偏离，已按 D8/D9 补齐：
+
+**(1) 效应表从行表改 dense 索引。** 原来 `infoOf` 每步线性扫约 80 行，百万步就是热点。改成 256 槽一次性摊平，`infoOf` 退化成两次数组访问。
+
+**(2) 指令接管面补上。** §6 承诺 opcode handler，首版代码里 `infoOf == nullptr` 直接 Bail，扩展包无路可走。现在主循环**先**查 `opcodeHandlers` 再查效应表——表外 opcode 也能接管，「缺什么补什么」不必等核心补表。
+
+**(3) 默认 handler 从 Bail 改为类型传播。** 这是 D8 的原文，但首版 `executeValue` 的 `default:` 是 Bail。现在改成「弹掉该弹的槽、压出正确类型的 Unknown」：值算不出来是常态，不是失败；真正需要具体值的地方（分支、switch 键、数组下标）各自有具体性检查兜底。用户没补环境的表现，是一路 Unknown 走到分支处，而不是第一条没见过的指令就断链。
+
+**(4) 栈指令的 cat2 形态。** `pop2`/`dup2`/`dup_x2`/`dup2_x1`/`dup2_x2` 在 JVMS §6.5 里各有 2~4 种形，首版只做了全 cat1 那一形，`pop2` 还错发成 `pop`。现在按形分流：本模型一个值一个条目，cat2 只影响「弹几个条目」。
+
+同时补齐了：`dup_x2 = 0x5b` 常量错（首版误作 0x5d，那是 `dup2_x1`）、opcode 常量补全到 202 条、约 190 条效应表、`ldc` 的 class 常量与 `Session::classObjectOf`（`ldc` 类常量与 `Class.forName` 必须同一对象，否则 `if_acmpeq` 假性失败）、数组面按元素宽度与符号性建模（`[B` 有符号、`[Z`/`[C` 无符号）、实例字段面（`HeapObj.fields`）、`getfield`/`putfield`、浮点与饱和转换、整数除零明确 Bail（需异常派发，不编造商）。
 
 ## 附录 A：存量证据
 
