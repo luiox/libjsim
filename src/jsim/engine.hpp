@@ -158,6 +158,12 @@ struct Session {
     /// 返回 nullptr 表示不认领，引擎照常 Bail。返回的 mock 由注册方持有，
     /// 引擎只读一次即拷贝。
     std::function<CallMock*(const CallRef& callee, Frame& frame)> callMockResolver;
+    /// 兜底解析链：单槽不认领时按注册序逐个问。
+    ///
+    /// 单槽只够一个注册方用。反射面（注解代理）、跨方法编排（容器内方法）、
+    /// 方法句柄面都靠「运行期看接收者才决定认不认领」这套语义，谁也不能独占
+    /// 这个口子——否则后装的把先装的顶掉，且失效是静默的。
+    std::vector<std::function<CallMock*(const CallRef& callee, Frame& frame)>> callMockResolvers;
     u64 nextAllocId = 1;
 
     void observe(u32 pc, u8 opcode, const std::vector<SimValue>& stack) {
@@ -1548,6 +1554,10 @@ private:
         Frame frame(stack_, pc, *method_, *session_);
         if (mock == nullptr && session_->callMockResolver) {
             mock = session_->callMockResolver(callee, frame);
+        }
+        for (usize i = 0; mock == nullptr && i < session_->callMockResolvers.size(); ++i) {
+            if (!session_->callMockResolvers[i]) continue;
+            mock = session_->callMockResolvers[i](callee, frame);
         }
         if (mock == nullptr) {
             return bailStep({Bail::Reason::UnsupportedCall, pc, "调用未注册接管：" + key});

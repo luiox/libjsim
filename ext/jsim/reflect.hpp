@@ -305,43 +305,46 @@ inline void install(Session& session, MetaProvider provider) {
 
     // 注解元素访问器：兜底解析。只认领「接收者是注解代理 + 无参有返回值」的调用，
     // 认不出就返回 nullptr 交回核心 Bail——绝不把真正的缺环境吞成 Unknown。
-    session.callMockResolver = [state](const CallRef& callee, Frame& frame) -> CallMock* {
-        if (callee.desc.size() < 3 || callee.desc[0] != '(' || callee.desc[1] != ')') {
-            return nullptr;
-        }
-        // 无参形态：接收者就在栈顶。不是注解代理就不是本包的事。
-        Result<SimValue, Bail> recv = frame.peekChecked(0);
-        if (!recv.isOk() || !recv.value().known) return nullptr;
-        if (recv.value().ref.kind != RefPayload::Kind::Obj) return nullptr;
-        if (state->proxies.count(recv.value().ref.objId) == 0) return nullptr;
+    //
+    // 走解析链而不是单槽：跨方法编排等扩展也想要这个口子，单槽会被后装的顶掉。
+    session.callMockResolvers.push_back(
+        [state](const CallRef& callee, Frame& frame) -> CallMock* {
+            if (callee.desc.size() < 3 || callee.desc[0] != '(' || callee.desc[1] != ')') {
+                return nullptr;
+            }
+            // 无参形态：接收者就在栈顶。不是注解代理就不是本包的事。
+            Result<SimValue, Bail> recv = frame.peekChecked(0);
+            if (!recv.isOk() || !recv.value().known) return nullptr;
+            if (recv.value().ref.kind != RefPayload::Kind::Obj) return nullptr;
+            if (state->proxies.count(recv.value().ref.objId) == 0) return nullptr;
 
-        const std::string key = callee.name + callee.desc;
-        auto cached = state->accessorMocks.find(key);
-        if (cached != state->accessorMocks.end()) return &cached->second;
+            const std::string key = callee.name + callee.desc;
+            auto cached = state->accessorMocks.find(key);
+            if (cached != state->accessorMocks.end()) return &cached->second;
 
-        const std::string elementName = "@" + callee.name;
-        const ValType retType = detail::retTypeOfDesc(callee.desc);
-        CallMock mock = [elementName, retType](Frame& frame) -> Result<SimValue, Bail> {
-            Result<SimValue, Bail> recv = frame.popChecked();
-            if (!recv.isOk()) return Result<SimValue, Bail>::err(recv.error());
-            if (!recv.value().known || recv.value().ref.kind != RefPayload::Kind::Obj) {
-                return Result<SimValue, Bail>::ok(SimValue::unknownOf(retType));
-            }
-            Session& session = frame.session();
-            auto it = session.heap.find(recv.value().ref.objId);
-            if (it == session.heap.end()) {
-                return Result<SimValue, Bail>::ok(SimValue::unknownOf(retType));
-            }
-            auto slot = it->second.fields.find(elementName);
-            if (slot == it->second.fields.end()) {
-                return Result<SimValue, Bail>::ok(SimValue::unknownOf(retType));
-            }
-            SimValue v = slot->second;
-            v.type = retType;
-            return Result<SimValue, Bail>::ok(v);
-        };
-        return &state->accessorMocks.emplace(key, std::move(mock)).first->second;
-    };
+            const std::string elementName = "@" + callee.name;
+            const ValType retType = detail::retTypeOfDesc(callee.desc);
+            CallMock mock = [elementName, retType](Frame& frame) -> Result<SimValue, Bail> {
+                Result<SimValue, Bail> recv = frame.popChecked();
+                if (!recv.isOk()) return Result<SimValue, Bail>::err(recv.error());
+                if (!recv.value().known || recv.value().ref.kind != RefPayload::Kind::Obj) {
+                    return Result<SimValue, Bail>::ok(SimValue::unknownOf(retType));
+                }
+                Session& session = frame.session();
+                auto it = session.heap.find(recv.value().ref.objId);
+                if (it == session.heap.end()) {
+                    return Result<SimValue, Bail>::ok(SimValue::unknownOf(retType));
+                }
+                auto slot = it->second.fields.find(elementName);
+                if (slot == it->second.fields.end()) {
+                    return Result<SimValue, Bail>::ok(SimValue::unknownOf(retType));
+                }
+                SimValue v = slot->second;
+                v.type = retType;
+                return Result<SimValue, Bail>::ok(v);
+            };
+            return &state->accessorMocks.emplace(key, std::move(mock)).first->second;
+    });
 }
 
 } // namespace reflect
