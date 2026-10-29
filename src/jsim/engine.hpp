@@ -80,15 +80,32 @@ struct HeapObj {
 
 struct Session;
 
+/// 观测面的结构化步进视图：每条指令**执行前**对栈与局部变量的只读快照。
+/// 观测属于观测面（D2）：只读、不改帧，观测方要控制流时用断点熔断或接管面。
+struct StepView {
+    u32 pc = 0;
+    u8 opcode = 0;
+    const std::vector<SimValue>* stack = nullptr;
+    const std::vector<SimValue>* locals = nullptr;
+    const Method* method = nullptr;
+    const Session* session = nullptr;
+};
+
 /// 完整进入帧视图（设计 §6 红线：钩子与接管收完整帧，引擎不预弹栈）。
 class Frame {
 public:
-    Frame(std::vector<SimValue>& stack, u32 pc, const Method& method, Session& session)
-        : stack_(&stack), pc_(pc), method_(&method), session_(&session) {}
+    Frame(std::vector<SimValue>& stack, std::vector<SimValue>& locals, u32 pc,
+          const Method& method, Session& session)
+        : stack_(&stack), locals_(&locals), pc_(pc), method_(&method), session_(&session) {}
 
     u32 pc() const { return pc_; }
     const Method& method() const { return *method_; }
     Session& session() const { return *session_; }
+
+    /// 只读栈视图（观测与接管方判定形态用；写操作走 push/popChecked）。
+    const std::vector<SimValue>& stack() const { return *stack_; }
+    /// 只读局部变量视图。
+    const std::vector<SimValue>& locals() const { return *locals_; }
 
     /// 受检弹栈：下溢返回 Bail{StackBroken}，不产生未定义行为。
     Result<SimValue, Bail> popChecked() {
@@ -112,6 +129,7 @@ public:
 
 private:
     std::vector<SimValue>* stack_ = nullptr;
+    std::vector<SimValue>* locals_ = nullptr;
     u32 pc_ = 0;
     const Method* method_ = nullptr;
     Session* session_ = nullptr;
@@ -121,8 +139,15 @@ private:
 /// 返回 Known/Unknown 值即接管语义；返回 Bail 即该调用点无法继续。
 using CallMock = std::function<Result<SimValue, Bail>(Frame&)>;
 
+/// 字段接管（设计 §6）：get 系返回注入值（引擎按描述符定型压栈），put 系自行
+/// 经 Frame 弹栈记录、返回值被忽略。get/put 共用一个键，接管方按
+/// frame.method().code[frame.pc()].opcode 区分指令。
+using FieldMock = std::function<Result<SimValue, Bail>(Frame&)>;
+
 /// 分支接管（设计 §4.4 三态）：返回 true/false 即单边裁决，返回 Bail 即放弃。
-using BranchHook = std::function<Result<bool, Bail>(u32 pc)>;
+/// 收完整进入帧（§6 红线）：条件操作数仍在栈上，接管方经 peekChecked 窥视；
+/// 操作数由引擎在裁决后统一弹出，接管方只裁决不消费。
+using BranchHook = std::function<Result<bool, Bail>(Frame&)>;
 
 /// 指令接管的产出：只管控制流，栈由接管方经 Frame 自行操作（设计 §6 红线）。
 struct OpOutcome {
@@ -139,6 +164,10 @@ struct OpOutcome {
 /// 核心补表；表里有但默认语义不够的，接管优先。
 using OpHandler = std::function<Result<OpOutcome, Bail>(Frame&)>;
 
+/// 步进观测：每条指令执行前收到结构化只读视图（设计 §6 观测面）。
+/// 注册期过滤由观测方自行包一层完成（按 pc/opcode 忽略即可）。
+using StepObserver = std::function<void(const StepView&)>;
+
 /// 会话：接管注册表、分配脚手架、堆、静态字段、观测口。核心不内置任何 JDK
 /// 语义（设计 D10）；静态字段值是「多方法编排」的接力棒——clinit 先跑，
 /// 后续方法读同一 Session。
@@ -147,11 +176,15 @@ struct Session {
     std::unordered_map<u32, CallMock> callMocksAtPc;      // 按调用点注册，优先于按签名
     std::unordered_map<u8, OpHandler> opcodeHandlers;     // 指令接管，优先于效应表
     std::unordered_map<u32, BranchHook> branchHooks;      // 分支接管，按 pc
+    std::unordered_map<std::string, FieldMock> fieldMocks; // 字段接管，键 = owner.name+desc（§6）
     std::unordered_map<std::string, std::function<std::string()>> allocScaffolds; // 类名 → 初始载荷工厂
     std::unordered_map<u64, HeapObj> heap;
     std::unordered_map<std::string, SimValue> statics;    // 键 = owner::name::desc
     std::unordered_map<std::string, u64> classObjects;    // 类名 → Class 对象 id
     std::function<void(u32 pc, const char* opcode, const std::string& stackText)> trace;
+    std::vector<StepObserver> stepObservers;              // 结构化步进观测（指令前）
+    /// Bail 现场回调：finishBail 时带终止现场（栈与局部变量快照）。
+    std::function<void(const Bail&, const StepView&)> bailObserver;
     /// 兜底解析：按签名查不到时问它一次。反射面（注解元素访问器、getter 家族）
     /// 的语义由**接收者对象**决定，静态签名键匹配不到——这类「方法名就是数据」
     /// 的调用只能运行期解析。给的是完整帧，解析方可以窥视接收者再决定认不认领；
@@ -203,10 +236,22 @@ struct Prefill {
 };
 
 struct Limits {
+    /// 断点哨兵：不熔断。
+    static constexpr u32 kNoStopPc = 0xFFFFFFFFu;
+
     u64 maxSteps = 4096;
+    /// 合并点栈形一致性校验（设计 §5）：同一 pc 二次到达时深度或类型序列
+    /// 不一致即 Bail{StackBroken}。关闭时引擎信任预填与接管方。
+    bool checkBalance = false;
+    /// 区间模式容忍域外出口：越过方法尾按 Completed(void) 收尾而不是 Bail
+    /// （设计 §5「容忍预填栈与域外出口」）。
+    bool tolerateOffEnd = false;
+    /// 断点熔断（观测面）：执行前命中即停，按 LimitHit 语义收尾并带帧快照，
+    /// 配区间起步（把快照灌回 Prefill）即可续跑。
+    u32 stopAtPc = kNoStopPc;
 };
 
-/// 运行结果三态（设计 D6）：Completed 带可选返回值 / Bailed 带现场 / LimitHit 带步数。
+/// 运行结果三态（设计 D6）：Completed 带可选返回值 / Bailed 带现场 / LimitHit 帧步数。
 struct RunResult {
     enum class Kind : u8 {
         Completed,
@@ -219,12 +264,33 @@ struct RunResult {
     SimValue returnValue;
     Bail bail;
     u64 steps = 0;
+    /// 终止帧快照（三种终态都带）：断点续跑把它灌回 Prefill，Bail 现场由此
+    /// 落地（观测面承诺的「帧快照 / Bail 现场」）。
+    std::vector<SimValue> finalStack;
+    std::vector<SimValue> finalLocals;
 };
 
 /// 单方法模拟器（设计 D9）：一个实例绑定一个方法，跨方法不递归。
 class Sim {
 public:
     Sim(const Method& method, Session& session) : method_(&method), session_(&session) {}
+
+    /// 方法入口起步（设计 §5 便利入口一）：pc = 0，栈平衡校验默认开。
+    RunResult runEntry(Prefill prefill, u64 maxSteps = 4096) {
+        Limits lim;
+        lim.maxSteps = maxSteps;
+        lim.checkBalance = true;
+        return run(0, std::move(prefill), lim);
+    }
+
+    /// 区间起步（设计 §5 便利入口二）：任意 pc，栈平衡默认关、容忍预填栈与
+    /// 域外出口。
+    RunResult runRegion(u32 entryPc, Prefill prefill, u64 maxSteps = 4096) {
+        Limits lim;
+        lim.maxSteps = maxSteps;
+        lim.tolerateOffEnd = true;
+        return run(entryPc, std::move(prefill), lim);
+    }
 
     RunResult run(u32 entryPc, Prefill prefill, Limits limits) {
         RunResult out;
@@ -244,24 +310,49 @@ public:
             stack_[slot.first] = slot.second;
         }
 
+        // 栈平衡记事（§5）：同 pc 首达记形状，再达比对深度与类型序列。
+        std::vector<char> balanceSeen;
+        std::vector<std::vector<ValType>> balanceShape;
+        if (limits.checkBalance) {
+            balanceSeen.assign(method_->code.size(), 0);
+            balanceShape.resize(method_->code.size());
+        }
+
         u32 pc = entryPc;
         while (true) {
             if (pc >= method_->code.size()) {
+                if (limits.tolerateOffEnd) {
+                    out.kind = RunResult::Kind::Completed;
+                    return finish(out);
+                }
                 return finishBail(out, {Bail::Reason::OffMethodEnd, pc, "越过方法尾"});
             }
             if (out.steps >= limits.maxSteps) {
                 out.kind = RunResult::Kind::LimitHit;
-                return out;
+                return finish(out);
+            }
+            if (pc == limits.stopAtPc) {
+                // 断点熔断：执行前停，LimitHit 语义，帧快照在 result 里。
+                out.kind = RunResult::Kind::LimitHit;
+                return finish(out);
             }
 
             const Insn insn = method_->code[pc];
+
+            if (!session_->stepObservers.empty()) {
+                fireStepObservers(pc, insn.opcode);
+            }
+            if (limits.checkBalance && !balancePass(pc, balanceSeen, balanceShape)) {
+                return finishBail(out, {Bail::Reason::StackBroken, pc,
+                                        "合并点栈形不一致（深度或类型序列）"});
+            }
 
             // 指令接管优先于效应表（设计 §6）。表外 opcode 因此也能被接管，
             // 「缺什么补什么」不必等核心补表——这是扩展包补环境的最后一层。
             auto handlerIt = session_->opcodeHandlers.find(insn.opcode);
             if (handlerIt != session_->opcodeHandlers.end()) {
                 OpHandler handler = handlerIt->second; // 拷贝：接管内改注册表会失效迭代器
-                Frame     frame(stack_, pc, *method_, *session_);
+                Frame     frame(stack_, locals_, pc, *method_, *session_);
                 Result<OpOutcome, Bail> outcome = handler(frame);
                 out.steps += 1;
                 if (!outcome.isOk()) return finishBail(out, outcome.error());
@@ -270,7 +361,7 @@ public:
                     out.kind = RunResult::Kind::Completed;
                     out.hasReturnValue = o.hasReturnValue;
                     out.returnValue = std::move(o.returnValue);
-                    return out;
+                    return finish(out);
                 }
                 session_->observe(pc, insn.opcode, stack_);
                 pc = (o.nextPc == kNextPc) ? pc + 1 : o.nextPc;
@@ -289,7 +380,7 @@ public:
                 out.kind = RunResult::Kind::Completed;
                 out.hasReturnValue = step.hasReturnValue;
                 out.returnValue = std::move(step.value);
-                return out;
+                return finish(out);
             }
             if (step.kind == StepResult::Kind::BailOut) {
                 return finishBail(out, std::move(step.bail));
@@ -317,10 +408,44 @@ private:
         Bail bail;
     };
 
-    static RunResult finishBail(RunResult& out, Bail b) {
+    /// 终止收尾：带上终止帧快照（Completed / Bailed / LimitHit 共用）。
+    RunResult finish(RunResult& out) {
+        out.finalStack = stack_;
+        out.finalLocals = locals_;
+        return out;
+    }
+
+    RunResult finishBail(RunResult& out, Bail b) {
         out.kind = RunResult::Kind::Bailed;
         out.bail = std::move(b);
-        return out;
+        if (session_->bailObserver) {
+            StepView view{out.bail.pc, 0, &stack_, &locals_, method_, session_};
+            session_->bailObserver(out.bail, view);
+        }
+        return finish(out);
+    }
+
+    /// 步进观测：指令执行前发结构化只读视图。按索引快照数量遍历——观测内
+    /// 动态注册的新观测下一条指令才生效，不失效迭代器。
+    void fireStepObservers(u32 pc, u8 opcode) {
+        StepView view{pc, opcode, &stack_, &locals_, method_, session_};
+        const usize count = session_->stepObservers.size();
+        for (usize i = 0; i < count && i < session_->stepObservers.size(); ++i) {
+            if (session_->stepObservers[i]) session_->stepObservers[i](view);
+        }
+    }
+
+    /// 合并点栈形校验（§5）：首达记录深度与类型序列，再达比对。
+    bool balancePass(u32 pc, std::vector<char>& seen, std::vector<std::vector<ValType>>& shape) {
+        std::vector<ValType> current;
+        current.reserve(stack_.size());
+        for (const SimValue& v : stack_) current.push_back(v.type);
+        if (!seen[pc]) {
+            seen[pc] = 1;
+            shape[pc] = std::move(current);
+            return true;
+        }
+        return shape[pc] == current;
     }
 
     static StepResult nextStep(SimValue toPush) {
@@ -350,6 +475,23 @@ private:
         SimValue v = stack_.back();
         stack_.pop_back();
         return Result<SimValue, Bail>::ok(v);
+    }
+
+    /// 受检窥视（不弹出）：分支在裁决前取操作数形态用。
+    Result<SimValue, Bail> peekChecked(u32 pc, usize fromTop = 0) const {
+        if (stack_.size() <= fromTop) {
+            return Result<SimValue, Bail>::err({Bail::Reason::StackBroken, pc, "窥视越界"});
+        }
+        return Result<SimValue, Bail>::ok(stack_[stack_.size() - 1 - fromTop]);
+    }
+
+    /// 弹掉 n 个操作数（分支裁决后统一消费）。
+    StepResult dropOperands(u32 pc, u8 n) {
+        for (int i = 0; i < n; ++i) {
+            Result<SimValue, Bail> popped = popChecked(pc);
+            if (!popped.isOk()) return bailStep(popped.error());
+        }
+        return StepResult{};
     }
 
     /// 类型传播默认语义（设计 D8）：弹 N 槽，全 Known 算值，否则压正确类型 Unknown。
@@ -538,7 +680,8 @@ private:
             if (entry.kind == CpEntry::Kind::Class) {
                 return nextStep(SimValue::knownObj(session_->classObjectOf(entry.className)));
             }
-            return nextStep(SimValue::knownStr(entry.strValue));
+            // ldc 字符串是常量池字面量：intern 事实，身份可判（compareRef）。
+            return nextStep(SimValue::internedStr(entry.strValue));
         }
         case op::FConst0:
             return nextStep(SimValue::knownF32(0.0f));
@@ -1118,26 +1261,40 @@ private:
         }
     }
 
-    /// 分支纪律（设计 §4.4/D7）：全 Known 单边裁决；Unknown 不 fork，
+    /// 分支纪律（设计 §4.4/D7）：全 Known 且身份可判才单边裁决；否则不 fork，
     /// 交给分支接管三态，未注册接管即 Bail{NotConcrete}。
+    ///
+    /// §6 红线：引擎不预弹栈——先窥视操作数判定可裁决性，接管收完整进入帧
+    /// （操作数仍在栈上），裁决后由引擎统一弹出。
     StepResult executeBranch(u32 pc, const Insn& insn, const OpInfo& info) {
         std::vector<SimValue> args;
         for (int i = 0; i < info.popSlots; ++i) {
-            Result<SimValue, Bail> popped = popChecked(pc);
-            if (!popped.isOk()) return bailStep(popped.error());
-            args.push_back(std::move(popped.value()));
+            Result<SimValue, Bail> peeked = peekChecked(pc, static_cast<usize>(i));
+            if (!peeked.isOk()) return bailStep(peeked.error());
+            args.push_back(std::move(peeked.value()));
         }
 
-        bool allKnown = true;
-        for (const SimValue& a : args) allKnown = allKnown && a.known;
-        if (!allKnown) {
+        // args 按窥视序（顶在前）：args[0] = value2（后压），args.back() = value1（先压）。
+        // JVM if_icmp<cond> 语义是 value1 <cond> value2。单操作数 if<cond> 只有 args[0]。
+        bool evaluable = true;
+        for (const SimValue& a : args) evaluable = evaluable && a.known;
+        if (evaluable && (insn.opcode == op::IfAcmpeq || insn.opcode == op::IfAcmpne)) {
+            // 引用相等：非 interned 的 Str 身份不可判（真 JVM 里是两个对象），
+            // 按条件不具体处理，绝不能按内容判同。
+            if (compareRef(args[1], args[0]) == RefCmp::Unknown) evaluable = false;
+        }
+
+        if (!evaluable) {
             auto hook = session_->branchHooks.find(pc);
             if (hook == session_->branchHooks.end()) {
                 return bailStep({Bail::Reason::NotConcrete, pc, "分支条件不具体且未注册分支接管"});
             }
             BranchHook verdict = hook->second; // 拷贝：接管内若动态改注册表，迭代器会失效
-            Result<bool, Bail> ruled = verdict(pc);
+            Frame frame(stack_, locals_, pc, *method_, *session_);
+            Result<bool, Bail> ruled = verdict(frame);
             if (!ruled.isOk()) return bailStep(ruled.error());
+            StepResult consumed = dropOperands(pc, info.popSlots);
+            if (consumed.kind == StepResult::Kind::BailOut) return consumed;
             return ruled.value() ? jumpStep(static_cast<u32>(insn.a)) : StepResult{};
         }
 
@@ -1145,8 +1302,6 @@ private:
             return static_cast<i32>(args[i].asU32());
         };
 
-        // args 按弹出序（顶在前）：args[0] = value2（后压），args[1] = value1（先压）。
-        // JVM if_icmp<cond> 语义是 value1 <cond> value2。单操作数 if<cond> 只有 args[0]。
         bool taken = false;
         switch (insn.opcode) {
         case op::IfEq: taken = signedAt(0) == 0; break;
@@ -1161,28 +1316,43 @@ private:
         case op::IfIcmpge: taken = signedAt(1) >= signedAt(0); break;
         case op::IfIcmpgt: taken = signedAt(1) > signedAt(0); break;
         case op::IfIcmple: taken = signedAt(1) <= signedAt(0); break;
-        // 引用比较：null 只与 null 相等；对象比句柄；字符串常量按内容比
+        // 引用比较：null 只与 null 相等；对象比句柄；interned 字面量按内容比
         // （同一 ldc 字面量在常量池里必然同一对象，这是 intern 的事实，
-        // 而不是 String.equals 语义）。
+        // 而不是 String.equals 语义）；非 interned 的 Str 身份不可判，已在
+        // evaluable 判定中折回接管面。
         case op::IfNull: taken = args[0].ref.kind == RefPayload::Kind::Null; break;
         case op::IfNonNull: taken = args[0].ref.kind != RefPayload::Kind::Null; break;
-        case op::IfAcmpeq: taken = sameRef(args[1], args[0]); break;
-        case op::IfAcmpne: taken = !sameRef(args[1], args[0]); break;
+        case op::IfAcmpeq: taken = compareRef(args[1], args[0]) == RefCmp::Same; break;
+        case op::IfAcmpne: taken = compareRef(args[1], args[0]) != RefCmp::Same; break;
         default:
             return bailStep({Bail::Reason::UnsupportedOpcode, pc, "分支指令缺语义"});
         }
+        StepResult consumed = dropOperands(pc, info.popSlots);
+        if (consumed.kind == StepResult::Kind::BailOut) return consumed;
         return taken ? jumpStep(static_cast<u32>(insn.a)) : StepResult{};
     }
 
-    /// 引用相等判定（仅对 Known 引用调用，未知引用走分支接管）。
-    static bool sameRef(const SimValue& a, const SimValue& b) {
+    /// 引用相等三态判定（仅对 Known 引用调用，未知引用走分支接管）。
+    /// Unknown = 身份不可判：非 interned 的 Str 载荷没有第二身份键，真 JVM 里
+    /// 动态构造的同内容字符串是两个对象，按内容判同会把 == 假性折真。
+    enum class RefCmp : u8 {
+        Same,
+        Diff,
+        Unknown,
+    };
+
+    static RefCmp compareRef(const SimValue& a, const SimValue& b) {
         const bool aNull = a.ref.kind == RefPayload::Kind::Null;
         const bool bNull = b.ref.kind == RefPayload::Kind::Null;
-        if (aNull || bNull) return aNull && bNull;
+        if (aNull || bNull) return (aNull && bNull) ? RefCmp::Same : RefCmp::Diff;
         if (a.ref.kind == RefPayload::Kind::Obj || b.ref.kind == RefPayload::Kind::Obj) {
-            return a.ref.kind == b.ref.kind && a.ref.objId == b.ref.objId;
+            return (a.ref.kind == b.ref.kind && a.ref.objId == b.ref.objId) ? RefCmp::Same
+                                                                           : RefCmp::Diff;
         }
-        return a.ref.str == b.ref.str;
+        if (a.ref.interned && b.ref.interned) {
+            return a.ref.str == b.ref.str ? RefCmp::Same : RefCmp::Diff;
+        }
+        return RefCmp::Unknown;
     }
 
     /// switch 系：键 Known 查表或走 default；Unknown 不 fork，直接 Bail{NotConcrete}
@@ -1254,22 +1424,13 @@ private:
             session_->heap[id] = std::move(obj);
             return nextStep(SimValue::knownObj(id));
         }
-        case op::ANewArray:
-        case op::MultiANewArray: {
-            // 多维只建最外层：内层元素留 null/Unknown 引用，不递归展开（设计 D9
-            // 不递归的同一口径）。栈上 dims 个长度都要弹掉，否则栈形会错位。
-            const i32 dims = insn.opcode == op::MultiANewArray && insn.b > 1 ? insn.b : 1;
-            std::vector<SimValue> counts;
-            for (i32 i = 0; i < dims; ++i) {
-                Result<SimValue, Bail> popped = popChecked(pc);
-                if (!popped.isOk()) return bailStep(popped.error());
-                counts.push_back(std::move(popped.value()));
-            }
-            const SimValue& outermost = counts.back(); // count1 最先压入，在栈底
-            if (!outermost.known) {
+        case op::ANewArray: {
+            Result<SimValue, Bail> popped = popChecked(pc);
+            if (!popped.isOk()) return bailStep(popped.error());
+            if (!popped.value().known) {
                 return bailStep({Bail::Reason::NotConcrete, pc, "anewarray 长度不具体"});
             }
-            const i32 count = static_cast<i32>(outermost.asU32());
+            const i32 count = static_cast<i32>(popped.value().asU32());
             if (count < 0 || static_cast<u64>(count) > kMaxArrayElems) {
                 return bailStep({Bail::Reason::BadOperand, pc, "anewarray 长度越界"});
             }
@@ -1278,6 +1439,70 @@ private:
             HeapObj obj;
             obj.className = "[" + elemType;
             obj.refs.assign(static_cast<usize>(count), SimValue::knownNull());
+            session_->heap[id] = std::move(obj);
+            return nextStep(SimValue::knownObj(id));
+        }
+        case op::MultiANewArray: {
+            // JVMS §6.5：全部维度立即分配（数据嵌套，不是 D9 说的方法递归——
+            // 首版只建最外层、内层静默成 null，那是对指令语义的静默偏离）。
+            // 栈形：count1（最外层）先压，count_n（最内层）在顶；弹出序
+            // counts[0]=count_n … counts.back()=count1。
+            const i32 dims = insn.b > 1 ? insn.b : 1;
+            std::vector<SimValue> counts;
+            for (i32 i = 0; i < dims; ++i) {
+                Result<SimValue, Bail> popped = popChecked(pc);
+                if (!popped.isOk()) return bailStep(popped.error());
+                counts.push_back(std::move(popped.value()));
+            }
+            for (const SimValue& c : counts) {
+                if (!c.known) continue;
+                const i32 len = static_cast<i32>(c.asU32());
+                if (len < 0) {
+                    // 负长度是确定会发生的 NegativeArraySizeException，同除零纪律。
+                    return bailStep({Bail::Reason::BadOperand, pc,
+                                     "multianewarray 负长度需异常派发（v1 不做）"});
+                }
+                if (static_cast<u64>(len) > kMaxArrayElems) {
+                    return bailStep({Bail::Reason::BadOperand, pc, "multianewarray 长度越界"});
+                }
+            }
+            const SimValue& outermost = counts.back();
+            if (!outermost.known) {
+                return bailStep({Bail::Reason::NotConcrete, pc, "multianewarray 长度不具体"});
+            }
+            const i32 outerLen = static_cast<i32>(outermost.asU32());
+            const std::string& elemType = method_->allocTypes[static_cast<usize>(insn.a)];
+
+            bool allKnown = true;
+            for (const SimValue& c : counts) allKnown = allKnown && c.known;
+            if (allKnown) {
+                // 由最内层向外逐层建：第 L 层类名 = (dims-L+1) 个 '[' + elemType。
+                u64 childId = 0;
+                for (i32 level = dims; level >= 1; --level) {
+                    const i32 len = static_cast<i32>(counts[static_cast<usize>(dims - level)].asU32());
+                    const u64 id = session_->nextAllocId++;
+                    HeapObj obj;
+                    obj.className = std::string(static_cast<usize>(dims - level + 1), '[') + elemType;
+                    if (level == dims && !elemIsRefType(elemType)) {
+                        obj.elems.assign(static_cast<usize>(len), 0); // 最内层原始数组
+                    } else if (level == dims) {
+                        obj.refs.assign(static_cast<usize>(len), SimValue::knownNull());
+                    } else {
+                        obj.refs.assign(static_cast<usize>(len), SimValue::knownObj(childId));
+                    }
+                    session_->heap[id] = std::move(obj);
+                    childId = id;
+                }
+                return nextStep(SimValue::knownObj(childId));
+            }
+
+            // 内层长度未知：最外层照建（长度已知），元素挂 Unknown(Ref)——内层
+            // 数组在真 JVM 里确实存在且已分配，只是这一格指向谁不可知；读出来
+            // 按类型传播，不猜 null（null 是「已知指向空」的错误答案）。
+            const u64 id = session_->nextAllocId++;
+            HeapObj obj;
+            obj.className = std::string(static_cast<usize>(dims), '[') + elemType;
+            obj.refs.assign(static_cast<usize>(outerLen), SimValue::unknownOf(ValType::Ref));
             session_->heap[id] = std::move(obj);
             return nextStep(SimValue::knownObj(id));
         }
@@ -1337,6 +1562,11 @@ private:
     /// 引用数组判定：类名第二字符是 L（对象数组）或 [（数组的数组）。
     static bool isRefArray(const std::string& arrayClass) {
         return arrayClass.size() >= 2 && (arrayClass[1] == 'L' || arrayClass[1] == '[');
+    }
+
+    /// 元素类型是否引用形：L...; 对象或 [ 嵌套数组；单字符 primitive 除外。
+    static bool elemIsRefType(const std::string& elemType) {
+        return !elemType.empty() && (elemType[0] == 'L' || elemType[0] == '[');
     }
 
     static usize arrayLength(const HeapObj& obj) {
@@ -1473,12 +1703,40 @@ private:
         return StepResult{};
     }
 
-    /// 字段面：静态字段走 Session.statics（跨方法接力棒——clinit 先跑、后续方法
-    /// 读同一 Session），实例字段挂在 HeapObj.fields 上。缺项一律按字段类型传播
+    /// 实例字段键：同名同描述符即同一槽位（类名不参与，MVP 不做继承区分）。
+    static std::string instanceKey(const FieldRef& field) {
+        return field.name + "::" + field.desc;
+    }
+
+    /// 字段接管键：与调用接管同款 owner.name+desc。
+    static std::string fieldKey(const FieldRef& field) {
+        return field.owner + "." + field.name + field.desc;
+    }
+
+    /// 字段面（设计 §6 字段接管 + 会话存贮底座）：接管优先，命中即由接管方经
+    /// Frame 自己弹压（get 系返回值由引擎按描述符定型压栈，put 系忽略返回值）；
+    /// 未命中走底座——静态字段 Session.statics（跨方法接力棒：clinit 先跑、后续
+    /// 方法读同一 Session），实例字段挂 HeapObj.fields。缺项一律按字段类型传播
     /// 压 Unknown，不 Bail：字段没被赋值过是常态，不是错误。
+    /// Known null 接收者的 getfield/putfield 按 NPE 口径 Bail——那是一个确定会
+    /// 发生、而异常派发 v1 不做的事件，与整数除零同一纪律。
     StepResult executeField(u32 pc, const Insn& insn) {
         const FieldRef& field = method_->fields[static_cast<usize>(insn.a)];
         const std::string staticKey = field.owner + "::" + field.name + "::" + field.desc;
+
+        auto mockIt = session_->fieldMocks.find(fieldKey(field));
+        if (mockIt != session_->fieldMocks.end()) {
+            FieldMock mock = mockIt->second; // 拷贝：接管内改注册表会失效迭代器
+            Frame frame(stack_, locals_, pc, *method_, *session_);
+            Result<SimValue, Bail> taken = mock(frame);
+            if (!taken.isOk()) return bailStep(taken.error());
+            if (insn.opcode == op::PutStatic || insn.opcode == op::PutField) {
+                return StepResult{}; // put 系：接管方已消费操作数，返回值忽略
+            }
+            SimValue v = std::move(taken.value());
+            v.type = field.type; // 类型是静态事实，来自描述符而非接管方
+            return nextStep(std::move(v));
+        }
 
         switch (insn.opcode) {
         case op::GetStatic: {
@@ -1499,8 +1757,15 @@ private:
         case op::GetField: {
             Result<SimValue, Bail> recv = popChecked(pc);
             if (!recv.isOk()) return bailStep(recv.error());
-            if (!recv.value().known || recv.value().ref.kind != RefPayload::Kind::Obj) {
+            if (!recv.value().known) {
                 return nextStep(SimValue::unknownOf(field.type));
+            }
+            if (recv.value().ref.kind == RefPayload::Kind::Null) {
+                return bailStep({Bail::Reason::BadOperand, pc,
+                                 "getfield null 接收者需 NPE 派发（v1 不做）"});
+            }
+            if (recv.value().ref.kind != RefPayload::Kind::Obj) {
+                return nextStep(SimValue::unknownOf(field.type)); // Str 载荷无实例字段面
             }
             auto it = session_->heap.find(recv.value().ref.objId);
             if (it == session_->heap.end()) {
@@ -1519,8 +1784,15 @@ private:
             if (!value.isOk()) return bailStep(value.error());
             Result<SimValue, Bail> recv = popChecked(pc);
             if (!recv.isOk()) return bailStep(recv.error());
-            if (!recv.value().known || recv.value().ref.kind != RefPayload::Kind::Obj) {
+            if (!recv.value().known) {
                 return StepResult{}; // 接收者未知：无处落笔，不破坏堆态
+            }
+            if (recv.value().ref.kind == RefPayload::Kind::Null) {
+                return bailStep({Bail::Reason::BadOperand, pc,
+                                 "putfield null 接收者需 NPE 派发（v1 不做）"});
+            }
+            if (recv.value().ref.kind != RefPayload::Kind::Obj) {
+                return StepResult{};
             }
             auto it = session_->heap.find(recv.value().ref.objId);
             if (it == session_->heap.end()) return StepResult{};
@@ -1530,11 +1802,6 @@ private:
         default:
             return bailStep({Bail::Reason::UnsupportedOpcode, pc, "字段指令缺语义"});
         }
-    }
-
-    /// 实例字段键：同名同描述符即同一槽位（类名不参与，MVP 不做继承区分）。
-    static std::string instanceKey(const FieldRef& field) {
-        return field.name + "::" + field.desc;
     }
 
     /// invoke 系：查接管注册（调用点优先于签名），未注册一律 Bail{UnsupportedCall}。
@@ -1551,7 +1818,7 @@ private:
             if (bySig != session_->callMocks.end()) mock = &bySig->second;
         }
 
-        Frame frame(stack_, pc, *method_, *session_);
+        Frame frame(stack_, locals_, pc, *method_, *session_);
         if (mock == nullptr && session_->callMockResolver) {
             mock = session_->callMockResolver(callee, frame);
         }
