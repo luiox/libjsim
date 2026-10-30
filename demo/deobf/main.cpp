@@ -1,23 +1,30 @@
 /// @file main.cpp
-/// @brief 静态 deobf demo：运行时 javac 编译合成样本 → 最小面 classfile 解析 →
-///        桥接 jsim::Method → 模拟执行解密器，还原全部调用点密文并断言。
+/// @brief 静态 deobf demo：运行时 javac 编译合成样本 → libjbc 解析 → 桥接
+///        jsim::Method 模拟解密还原全部调用点密文 → libjbc 模型层改写导出
+///        去混淆 jar → 双重复查验（libjzip 重开对拍 + 真 JVM 对拍）。
 ///
 /// 管线：
 ///   JsimObfSample.java --javac --release 8--> JsimObfSample.class（临时目录，不入库）
-///     --解析--> 解密器指令序列 + 调用点密文（ldc 字符串）
-///     --桥接--> jsim::Method（指令 → Insn 表，字节偏移 → 指令下标）
-///     --Sim--> 每站点灌密文跑解密器 --> 明文 --> 断言 --> deobf 报告。
+///     --libjbc makeSessionFromBytes--> ClassSession（backing DOM + 指令级 IR）
+///     --消费方桥--> jsim::Method（CodeUnit → Method 形状搬运）
+///     --Sim--> 每站点灌密文跑解密器 --> 明文 --> 断言
+///     --libjbc 改写--> setString(ldc, 明文) + erase(invokestatic) + lowerMethod
+///       （CP 追加与偏移/StackMapTable 重算由 libjbc 负责）+ removeMethod(解密器)
+///       + writeClass --> class bytes --> JDK jar 工具打包 jsimobf-deobfed.jar
+///     --查验 A--> libjzip 读回 jar 条目，libjbc 重开：解密器摘除/调用点清零/
+///       明文 ldc 在位/可完整解析
+///     --查验 B--> java -cp 原始编译产物 vs deobfed jar：stdout 逐字节一致
+///       且等于期望明文（改写后的 jar 真能跑、输出不变）。
 ///
-/// JDK 定位走 libjdk_finder 0.1.1（demo target 独占依赖，核心零依赖纪律不动）：
-/// find_jdk 探测（JAVA_HOME → MJT_JDK_HOME → 默认安装位置扫描）→
-/// jdk_executable 解析 bin/javac 绝对路径。
-///
-/// 本文件的 classfile 解析器是 demo 自备桥（脚手架），不是库能力：仓的核心
-/// 零依赖纪律不动，正式消费方桥见设计稿 §9（CodeUnit → jsim::Method 的
-/// 会话面由消费方自备，桥不在本仓）。核心/扩展不认的语义按接管面注册：
-/// jsim-str 出 String.length/charAt；new java/lang/String 的分配脚手架与
-/// String.<init>([C)V 的「构造两阶段」语义由本 demo 注册（demo/main.cpp
-/// 场景 8/9 同款用法），不改库核心语义。
+/// classfile 的解析与改写全部经 libjbc（luiox-repo 包）：demo 不自备字节码
+/// 解析器/序列化器。CodeUnit → jsim::Method 的桥是本文件自备的消费方桥
+/// （设计稿 §9「桥由消费方自备」），只做形状搬运：指令摊 pc 索引、标签折 pc、
+/// ldc 族 CP 索引重映射成紧凑表下标；字符串按家族口径 MUTF-8 字节原样透传
+/// 给 jsim 载荷（BMP 非零码元下 MUTF-8 与 UTF-8 逐字节相同，jsim-str 按
+/// UTF-8 码元读）。核心/扩展不认的语义按接管面注册：jsim-str 出
+/// String.length/charAt；new java/lang/String 的分配脚手架与 String.<init>([C)V
+/// 的「构造两阶段」语义由本 demo 注册（demo/main.cpp 场景 8/9 同款用法），
+/// 不改库核心语义。
 
 /// std::getenv / std::fopen 在 MSVC CRT 标记为 deprecated；demo 有意用可移植面。
 #if defined(_MSC_VER)
@@ -28,7 +35,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
-#include <stdexcept>
+#include <fstream>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -40,6 +47,17 @@
 #include <windows.h>
 #endif
 
+#include "jbc/core/class_file.hpp"
+#include "jbc/core/constant_pool.hpp"
+#include "jbc/core/opcode.hpp"
+#include "jbc/core/writer.hpp"
+#include "jbc/ir/code_dom.hpp"
+#include "jbc/ir/error.hpp"
+#include "jbc/ir/units.hpp"
+
+#include "jzip/decompressor.hpp"
+#include "jzip/zip_reader.hpp"
+
 #include "jsim/engine.hpp"
 #include "jsim/str.hpp"
 
@@ -48,11 +66,6 @@ using namespace jsim;
 namespace fs = std::filesystem;
 
 namespace {
-
-/// 本文件用的窄位宽别名（jsim 家族只到 u8/u32，这里补齐 classfile 需要的档位）。
-using u16 = std::uint16_t;
-using i16 = std::int16_t;
-using i8 = std::int8_t;
 
 // ─────────────────────────── 断言与报告 ───────────────────────────
 
@@ -105,27 +118,65 @@ std::string escapeCipher(const std::string& simStr) {
     return out + "\"";
 }
 
-// ──────────────── JDK 定位（libjdk_finder）与现场编译 ────────────────
+// ─────────────────────── 文件与进程小件 ───────────────────────
+
+std::vector<u8> readFileBytes(const fs::path& p, bool& ok) {
+    ok = false;
+    std::ifstream in(p, std::ios::binary);
+    if (!in) return {};
+    std::vector<u8> bytes((std::istreambuf_iterator<char>(in)),
+                          std::istreambuf_iterator<char>());
+    // istreambuf_iterator 直接耗尽 streambuf，不置 eofbit——以 bad 判失败。
+    ok = !in.bad();
+    return bytes;
+}
+
+bool writeFileBytes(const fs::path& p, const std::vector<u8>& bytes) {
+    std::error_code ec;
+    fs::create_directories(p.parent_path(), ec);
+    std::ofstream out(p, std::ios::binary);
+    if (!out) return false;
+    out.write(reinterpret_cast<const char*>(bytes.data()),
+              static_cast<std::streamsize>(bytes.size()));
+    return out.good();
+}
+
+// ──────────────── JDK 工具定位（libjdk_finder）与现场编译 ────────────────
+
+struct JdkTools {
+    fs::path javaHome;
+    fs::path javac;
+    fs::path javaExe;
+    fs::path jar;
+};
 
 /// JDK 定位：libjdk_finder 0.1.1 的 find_jdk（JAVA_HOME → MJT_JDK_HOME →
-/// 默认安装位置扫描），再从定位到的 JDK 解析 bin/javac 绝对路径。
-/// 找不到时打印指引并返回空 path。
-fs::path locateJavac() {
+/// 默认安装位置扫描），再解析 bin 下 javac/java/jar 三个工具的绝对路径。
+/// 找不到时打印指引并置空成员。
+JdkTools locateJdkTools() {
+    JdkTools tools;
     const jdk_finder::JdkLocation jdk = jdk_finder::find_jdk();
     if (!jdk.available) {
         std::printf("libjdk_finder 未定位到 JDK：%s\n", jdk.reason.c_str());
         std::printf("请安装 JDK（12+ 支持 --release 8；建议 JDK 17），或设置 JAVA_HOME /\n");
         std::printf("MJT_JDK_HOME 指向含 bin/javac 的 JDK 主目录。\n");
-        return {};
+        return tools;
     }
-    const fs::path javac = jdk_finder::jdk_executable(jdk, "javac");
-    if (javac.empty()) {
+    tools.javaHome = jdk.java_home;
+    tools.javac = jdk_finder::jdk_executable(jdk, "javac");
+    tools.javaExe = jdk_finder::jdk_executable(jdk, "java");
+    tools.jar = jdk_finder::jdk_executable(jdk, "jar");
+    if (tools.javac.empty()) {
         std::printf("JDK 已定位（%s）但 bin 下无 javac，请确认是完整 JDK 而非 JRE。\n",
-                    jdk.java_home.string().c_str());
-        return {};
+                    tools.javaHome.string().c_str());
+        return JdkTools{};
     }
-    std::printf("JDK 定位（libjdk_finder 0.1.1）：%s\n", jdk.java_home.string().c_str());
-    return javac;
+    if (tools.javaExe.empty() || tools.jar.empty()) {
+        std::printf("JDK 已定位但 bin 下缺 java/jar 工具，无法完成对拍查验。\n");
+        return JdkTools{};
+    }
+    std::printf("JDK 定位（libjdk_finder 0.1.1）：%s\n", tools.javaHome.string().c_str());
+    return tools;
 }
 
 /// 现场编译：javac --release 8（class v52，与合成样本声明的目标代次一致）。
@@ -141,8 +192,12 @@ bool compileSample(const fs::path& javac, const fs::path& src, const fs::path& o
     const std::string cmd = "\"" + javac.string() + "\" --release 8 -encoding UTF-8 -d \"" +
                             outDir.string() + "\" \"" + src.string() + "\"";
     std::printf("编译：%s\n", cmd.c_str());
-    // cmd.exe 的老坑：整条命令以引号开头时会被剥错引号，外面再包一层。
+    // cmd.exe 的老坑：整条命令以引号开头时会被剥错引号，Windows 下外面再包一层。
+#if defined(_WIN32)
     const int rc = std::system(("\"" + cmd + "\"").c_str());
+#else
+    const int rc = std::system(cmd.c_str());
+#endif
     if (rc != 0) {
         std::printf("javac 退出码 %d。请确认 JDK 安装完整（bin/javac 可用）。\n", rc);
         return false;
@@ -164,457 +219,292 @@ fs::path locateSampleSource(const char* argv0) {
     return {};
 }
 
-// ──────────────── 最小面 classfile 解析（demo 自备桥） ────────────────
+// ─────────── 消费方桥（libjbc CodeUnit → jsim::Method，设计稿 §9） ───────────
+//
+// 只做形状搬运，不做语义解释：指令序列摊成 pc 索引、标签解析成 pc、ldc 族
+// CP 索引重映射成 jsim 侧紧凑表下标。任何一步拿不到确定信息就返回 false 并
+// 给出原因——宁可整方法放弃，也不产出「看起来能跑」的半截方法。
+namespace bridge {
 
-/// 常量池条目：只存 demo 需要的字段，槽位含义按 tag 解释。
-struct CpInfo {
-    u8 tag = 0;
-    u16 a = 0;         ///< Class/String→utf8 下标；Memberref→class 下标；NameAndType→name 下标
-    u16 b = 0;         ///< Memberref→NameAndType 下标；NameAndType→desc 下标
-    i32 intValue = 0;  ///< Integer 值 / Float 位型
-    i64 longValue = 0; ///< Long 值 / Double 位型
-    std::string utf8;  ///< Utf8 原始字节（MUTF-8）
-};
-
-struct MethodInfo {
-    std::string name;
-    std::string desc;
-    u16 access = 0;
-    u16 maxLocals = 0;
-    std::vector<u8> code; ///< 空 = 无 Code 属性
-};
-
-struct ClassFile {
-    u16 major = 0;
-    std::string thisClass;
-    std::vector<CpInfo> cp; ///< 1 基，cp[0] 占位
-    std::vector<MethodInfo> methods;
-
-    const std::string& utf8At(u16 idx) const {
-        if (idx == 0 || idx >= cp.size() || cp[idx].tag != 1) {
-            throw std::runtime_error("常量池 utf8 下标非法：" + std::to_string(idx));
-        }
-        return cp[idx].utf8;
+bool valTypeOfDescChar(char c, ValType& out) {
+    switch (c) {
+    case 'I': case 'Z': case 'B': case 'C': case 'S': out = ValType::I32; return true;
+    case 'J': out = ValType::I64; return true;
+    case 'F': out = ValType::F32; return true;
+    case 'D': out = ValType::F64; return true;
+    case 'L': case '[': out = ValType::Ref; return true;
+    default: return false;
     }
-
-    std::string classNameAt(u16 idx) const {
-        if (idx == 0 || idx >= cp.size() || cp[idx].tag != 7) {
-            throw std::runtime_error("常量池 class 下标非法：" + std::to_string(idx));
-        }
-        return utf8At(cp[idx].a);
-    }
-
-    /// Methodref/InterfaceMethodref → owner + name + desc。
-    struct MemberRef {
-        std::string owner;
-        std::string name;
-        std::string desc;
-    };
-
-    MemberRef methodRefAt(u16 idx) const {
-        if (idx == 0 || idx >= cp.size() || (cp[idx].tag != 9 && cp[idx].tag != 10 && cp[idx].tag != 11)) {
-            throw std::runtime_error("常量池 methodref 下标非法：" + std::to_string(idx));
-        }
-        const CpInfo& ref = cp[idx];
-        const CpInfo& nat = cp[ref.b];
-        return {classNameAt(ref.a), utf8At(nat.a), utf8At(nat.b)};
-    }
-};
-
-class ByteReader {
-public:
-    explicit ByteReader(const std::vector<u8>& bytes) : bytes_(&bytes) {}
-
-    u8 u1() {
-        need(1);
-        return (*bytes_)[pos_++];
-    }
-    u16 u2() {
-        need(2);
-        const u16 v = static_cast<u16>((static_cast<u16>((*bytes_)[pos_]) << 8) | (*bytes_)[pos_ + 1]);
-        pos_ += 2;
-        return v;
-    }
-    u32 u4() {
-        need(4);
-        const u32 v = (static_cast<u32>(u2()) << 16) | u2();
-        return v;
-    }
-    i32 s2() { return static_cast<i16>(u2()); }
-    i32 s4() { return static_cast<i32>(u4()); }
-    std::string raw(usize len) {
-        need(len);
-        std::string out(reinterpret_cast<const char*>(bytes_->data() + pos_), len);
-        pos_ += len;
-        return out;
-    }
-    void skip(usize n) {
-        need(n);
-        pos_ += n;
-    }
-    usize pos() const { return pos_; }
-    usize remaining() const { return bytes_->size() - pos_; }
-    void seek(usize p) {
-        if (p > bytes_->size()) throw std::runtime_error("classfile 越界 seek");
-        pos_ = p;
-    }
-
-private:
-    void need(usize n) const {
-        if (pos_ + n > bytes_->size()) throw std::runtime_error("classfile 越界读取");
-    }
-    const std::vector<u8>* bytes_;
-    usize pos_ = 0;
-};
-
-/// 只解析常量池 + 方法表 + Code 属性；字段表/属性表按长度跳过。
-ClassFile parseClass(const std::vector<u8>& bytes) {
-    ByteReader r(bytes);
-    if (r.u4() != 0xCAFEBABEu) throw std::runtime_error("非 class 文件（magic 不符）");
-    ClassFile cf;
-    r.u2(); // minor
-    cf.major = r.u2();
-    const u16 cpCount = r.u2();
-    cf.cp.resize(cpCount);
-    for (u16 i = 1; i < cpCount; ++i) {
-        CpInfo e;
-        e.tag = r.u1();
-        switch (e.tag) {
-        case 1: e.utf8 = r.raw(r.u2()); break;             // Utf8
-        case 3: e.intValue = static_cast<i32>(r.u4()); break; // Integer
-        case 4: e.intValue = static_cast<i32>(r.u4()); break; // Float（位型）
-        case 5:                                                // Long（占两槽）
-            e.longValue = (static_cast<i64>(r.u4()) << 32) | r.u4();
-            cf.cp[i++] = e;
-            break;
-        case 6:                                                // Double（占两槽）
-            e.longValue = (static_cast<i64>(r.u4()) << 32) | r.u4();
-            cf.cp[i++] = e;
-            break;
-        case 7: e.a = r.u2(); break;                          // Class → utf8
-        case 8: e.a = r.u2(); break;                          // String → utf8
-        case 9: case 10: case 11: e.a = r.u2(); e.b = r.u2(); break; // 成员引用
-        case 12: e.a = r.u2(); e.b = r.u2(); break;           // NameAndType
-        case 15: e.a = r.u1(); e.b = r.u2(); break;           // MethodHandle
-        case 16: e.a = r.u2(); break;                         // MethodType
-        case 17: case 18: e.a = r.u2(); e.b = r.u2(); break;  // Dynamic/InvokeDynamic
-        case 19: case 20: e.a = r.u2(); break;                // Module/Package
-        default: throw std::runtime_error("未知常量池 tag：" + std::to_string(e.tag));
-        }
-        cf.cp[i] = std::move(e);
-    }
-    r.skip(2); // access_flags
-    cf.thisClass = cf.classNameAt(r.u2());
-    r.skip(2); // super_class
-    r.skip(static_cast<usize>(r.u2()) * 2); // interfaces
-
-    const auto skipAttributes = [&r, &cf]() {
-        const u16 count = r.u2();
-        for (u16 i = 0; i < count; ++i) {
-            r.u2(); // name_index
-            const u32 len = r.u4();
-            r.skip(len);
-        }
-    };
-    const u16 fieldCount = r.u2(); // 字段表：按长度跳过
-    for (u16 i = 0; i < fieldCount; ++i) {
-        r.skip(6);
-        skipAttributes();
-    }
-    const u16 methodCount = r.u2();
-    cf.methods.resize(methodCount);
-    for (u16 i = 0; i < methodCount; ++i) {
-        MethodInfo& mi = cf.methods[i];
-        mi.access = r.u2();
-        mi.name = cf.utf8At(r.u2());
-        mi.desc = cf.utf8At(r.u2());
-        const u16 attrCount = r.u2();
-        for (u16 k = 0; k < attrCount; ++k) {
-            const std::string attrName = cf.utf8At(r.u2());
-            const u32 len = r.u4();
-            const usize attrStart = r.pos();
-            if (attrName == "Code") {
-                r.u2();          // max_stack
-                mi.maxLocals = r.u2();
-                const u32 codeLen = r.u4();
-                if (r.pos() + codeLen > attrStart + len) {
-                    throw std::runtime_error("Code 属性 code_length 越界");
-                }
-                mi.code = std::vector<u8>(bytes.begin() + static_cast<std::ptrdiff_t>(r.pos()),
-                                          bytes.begin() + static_cast<std::ptrdiff_t>(r.pos() + codeLen));
-            }
-            r.seek(attrStart + len); // 异常表/其余属性整体跳过
-        }
-    }
-    return cf;
 }
 
-/// MUTF-8 → UTF-16 码元。BMP 内与标准 UTF-8 同形，差别只在 NUL（C0 80）与
-/// 代理项（按两个独立码元保留，与 str 扩展的码元模拟口径一致）；坏编码抛错。
-std::vector<i32> decodeMutf8(std::string_view bytes) {
-    std::vector<i32> units;
-    usize i = 0;
-    while (i < bytes.size()) {
-        const u8 lead = static_cast<u8>(bytes[i]);
-        i32 unit = 0;
-        if (lead < 0x80) {
-            unit = lead;
-            i += 1;
-        } else if ((lead & 0xE0) == 0xC0 && i + 1 < bytes.size()) {
-            unit = ((lead & 0x1F) << 6) | (static_cast<u8>(bytes[i + 1]) & 0x3F);
-            i += 2;
-        } else if ((lead & 0xF0) == 0xE0 && i + 2 < bytes.size()) {
-            unit = ((lead & 0x0F) << 12) | ((static_cast<u8>(bytes[i + 1]) & 0x3F) << 6) |
-                   (static_cast<u8>(bytes[i + 2]) & 0x3F);
-            i += 3;
+/// 方法描述符返回段；`V` 置 hasReturn=false。
+bool retTypeOfDesc(std::string_view desc, ValType& out, bool& hasReturn) {
+    hasReturn = true;
+    const usize close = desc.find(')');
+    if (close == std::string_view::npos || close + 1 >= desc.size()) return false;
+    if (desc[close + 1] == 'V') {
+        hasReturn = false;
+        return true;
+    }
+    return valTypeOfDescChar(desc[close + 1], out);
+}
+
+bool fieldTypeOfDesc(std::string_view desc, ValType& out) {
+    return !desc.empty() && valTypeOfDescChar(desc.front(), out);
+}
+
+/// CP Class 条目 → 内部名（Class→Utf8 一跳）。
+std::string classNameOf(const jbc::core::ConstantPool& cp, ca::u32 classCp) {
+    if (!cp.valid(classCp)) return {};
+    const jbc::core::ConstantPool::Entry& e = cp.at(classCp);
+    if (e.tag != jbc::core::CpTag::Class) return {};
+    return std::string(cp.utf8Of(e.a));
+}
+
+/// CP 成员引用（Fieldref/Methodref/InterfaceMethodref）→ owner/name/desc。
+bool memberRefOf(const jbc::core::ConstantPool& cp, ca::u32 refCp, std::string& owner,
+                 std::string& name, std::string& desc) {
+    if (!cp.valid(refCp)) return false;
+    const jbc::core::ConstantPool::Entry& e = cp.at(refCp);
+    if (!cp.valid(e.b)) return false;
+    const jbc::core::ConstantPool::Entry& nat = cp.at(e.b);
+    if (nat.tag != jbc::core::CpTag::NameAndType) return false;
+    owner = classNameOf(cp, e.a);
+    name = std::string(cp.utf8Of(nat.a));
+    desc = std::string(cp.utf8Of(nat.b));
+    return !owner.empty() && !name.empty();
+}
+
+/// ldc 的 CP 条目搬进 jsim 紧凑表。String 走家族口径：MUTF-8 字节原样透传
+/// （BMP 非零码元与 UTF-8 逐字节相同，jsim-str 按 UTF-8 码元读）。
+bool appendCpEntry(const jbc::core::ConstantPool& cp, ca::u32 cpIndex, CpEntry& out) {
+    if (!cp.valid(cpIndex)) return false;
+    const jbc::core::ConstantPool::Entry& e = cp.at(cpIndex);
+    switch (e.tag) {
+    case jbc::core::CpTag::Integer:
+        out.kind = CpEntry::Kind::Int;
+        out.intValue = e.ival;
+        return true;
+    case jbc::core::CpTag::Float:
+        out.kind = CpEntry::Kind::Float;
+        out.intValue = e.ival; // 位型原样
+        return true;
+    case jbc::core::CpTag::Long:
+        out.kind = CpEntry::Kind::Long;
+        out.longValue = e.lval;
+        return true;
+    case jbc::core::CpTag::Double:
+        out.kind = CpEntry::Kind::Double;
+        out.longValue = e.lval; // 位型原样
+        return true;
+    case jbc::core::CpTag::String:
+        if (!cp.valid(e.a)) return false;
+        out.kind = CpEntry::Kind::Str;
+        out.strValue = std::string(cp.utf8Of(e.a));
+        return true;
+    case jbc::core::CpTag::Class:
+        out.kind = CpEntry::Kind::Class;
+        out.className = classNameOf(cp, cpIndex);
+        return !out.className.empty();
+    default:
+        return false;
+    }
+}
+
+bool isLdcFamily(jbc::core::Op op) {
+    return op == jbc::core::Op::LDC || op == jbc::core::Op::LDC_W
+           || op == jbc::core::Op::LDC2_W;
+}
+
+/// 指令句柄 → order() 下标的稳定散列键（owner 在单 DOM 内恒定）。
+ca::u64 insnKey(jbc::ir::InsnId id) {
+    return (static_cast<ca::u64>(id.slot) << 32) | static_cast<ca::u64>(id.gen);
+}
+
+ca::u64 labelKey(jbc::ir::LabelId id) {
+    return (static_cast<ca::u64>(id.slot) << 32) | static_cast<ca::u64>(id.gen);
+}
+
+/// 单方法转换（形状搬运）。失败时 why 带原因。
+bool toSimMethod(jbc::ir::ClassSession& s, ca::usize methodIdx, Method& out, std::string& why) {
+    const auto fail = [&why](const char* reason) {
+        why = reason;
+        return false;
+    };
+
+    if (!jbc::ir::hasCode(s, methodIdx)) return fail("方法无 Code 属性");
+    auto promoted = jbc::ir::promoteMethod(s, methodIdx);
+    if (promoted.is_err()) return fail("promoteMethod 失败");
+    jbc::ir::CodeUnitRef cu = promoted.unwrap();
+    if (!cu) return fail("promote 产物为空");
+
+    const jbc::ir::ClassUnit& unit = s.unit();
+    if (methodIdx >= unit.methods.size()) return fail("方法下标越界");
+    const jbc::ir::MethodUnit& mu = unit.methods[methodIdx];
+    const std::vector<jbc::ir::InsnId>& order = cu->dom.order();
+
+    // 指令句柄 → pc 下标。
+    std::unordered_map<ca::u64, ca::usize> insnPc;
+    insnPc.reserve(order.size() * 2);
+    for (ca::usize i = 0; i < order.size(); ++i) insnPc[insnKey(order[i])] = i;
+
+    // 标签 → pc：resolveLabel 折成下标；锚在方法末尾的标签折成 code.size()。
+    std::unordered_map<ca::u64, ca::usize> labelPc;
+    const auto resolveLabelPc = [&](jbc::ir::LabelId label, ca::usize& pc) -> bool {
+        const ca::u64 key = labelKey(label);
+        auto cached = labelPc.find(key);
+        if (cached != labelPc.end()) {
+            pc = cached->second;
+            return true;
+        }
+        auto resolved = cu->dom.resolveLabel(label);
+        if (resolved.is_err()) return false;
+        const jbc::ir::LabelTarget target = resolved.unwrap();
+        if (target.isEnd()) {
+            pc = order.size();
         } else {
-            throw std::runtime_error("MUTF-8 坏编码（demo 只覆盖 BMP 码元）");
+            auto at = insnPc.find(insnKey(target.insn));
+            if (at == insnPc.end()) return false;
+            pc = at->second;
         }
-        units.push_back(unit);
-    }
-    return units;
-}
+        labelPc.emplace(key, pc);
+        return true;
+    };
 
-/// 码元序列 → jsim 字符串（str 扩展的 UTF-8 码元模拟口径）。
-std::string unitsToSimStr(const std::vector<i32>& units) {
-    std::string out;
-    for (i32 unit : units) str::appendCodeUnit(out, unit);
-    return out;
-}
+    const jbc::core::ConstantPool& cp = s.backing().cp;
+    out = Method{};
+    out.name = std::string(unit.symbols().str(mu.name));
+    out.desc = std::string(unit.symbols().str(mu.desc));
+    out.maxLocals = cu->maxLocals;
+    out.code.reserve(order.size());
 
-// ─────────────────── 指令解码与 jsim::Method 桥接 ───────────────────
+    // ldc 族的 backing CP 索引 → jsim 紧凑表下标。
+    std::unordered_map<ca::u32, ca::i32> cpToLocal;
 
-/// 中间形：一条解码后的指令。a/b 含义按 opcode：分支/跳转的 a 是字节偏移
-/// （相对本指令起点），其余是指令操作数原值。
-struct RawInsn {
-    u32 offset = 0;
-    u8 opcode = 0;
-    i32 a = 0;
-    i32 b = 0;
-};
+    for (ca::usize i = 0; i < order.size(); ++i) {
+        const jbc::ir::Insn* in = cu->dom.peek(order[i]);
+        if (in == nullptr) return fail("指令句柄悬垂");
 
-/// 按字节边界完整走一遍方法体（含变长指令与 wide 展开）。
-std::vector<RawInsn> walkCode(const std::vector<u8>& code) {
-    std::vector<RawInsn> out;
-    ByteReader r(code);
-    while (r.remaining() > 0) {
-        RawInsn insn;
-        insn.offset = static_cast<u32>(r.pos());
-        insn.opcode = r.u1();
-        switch (insn.opcode) {
-        case 0x10: insn.a = static_cast<i8>(r.u1()); break;            // bipush
-        case 0x11: insn.a = r.s2(); break;                              // sipush
-        case 0x12: insn.a = r.u1(); break;                              // ldc
-        case 0x13: case 0x14: insn.a = r.u2(); break;                   // ldc_w / ldc2_w
-        case 0x15: case 0x16: case 0x17: case 0x18: case 0x19:          // 变长 load
-        case 0x36: case 0x37: case 0x38: case 0x39: case 0x3a:          // 变长 store
-            insn.a = r.u1();
-            break;
-        case 0x84: insn.a = r.u1(); insn.b = static_cast<i8>(r.u1()); break; // iinc
-        case 0x99: case 0x9a: case 0x9b: case 0x9c: case 0x9d: case 0x9e: // if<cond>
-        case 0x9f: case 0xa0: case 0xa1: case 0xa2: case 0xa3: case 0xa4:
-        case 0xa5: case 0xa6: case 0xa7: case 0xa9:                     // goto / jsr
-        case 0xc6: case 0xc7: insn.a = r.s2(); break;                   // ifnull 族
-        case 0xaa: { // tableswitch：4 字节对齐后 default/lo/hi/偏移表
-            r.skip((4u - ((insn.offset + 1u) % 4u)) % 4u);
-            r.s4();
-            const i32 lo = r.s4();
-            const i32 hi = r.s4();
-            r.skip(static_cast<usize>(hi - lo + 1) * 4);
-            break;
-        }
-        case 0xab: { // lookupswitch
-            r.skip((4u - ((insn.offset + 1u) % 4u)) % 4u);
-            r.s4();
-            const u32 pairs = r.u4() / 2; // match+offset 成对，每对 8 字节
-            r.skip(static_cast<usize>(pairs) * 8);
-            break;
-        }
-        case 0xb2: case 0xb3: case 0xb4: case 0xb5: // 字段
-        case 0xb6: case 0xb7: case 0xb8: case 0xb9: // 调用
-        case 0xbb: case 0xbd: case 0xc0: case 0xc1: // new/anewarray/checkcast/instanceof
-            insn.a = r.u2();
-            break;
-        case 0xba: insn.a = r.u2(); r.skip(2); break;                   // invokedynamic
-        case 0xbc: insn.b = r.u1(); break;                              // newarray（atype）
-        case 0xc5: insn.a = r.u2(); insn.b = r.u1(); break;             // multianewarray
-        case 0xc8: case 0xc9: insn.a = r.s4(); break;                   // goto_w / jsr_w
-        case 0xc4: { // wide：展开成底层指令，宽操作数直接落位
-            const u8 widened = r.u1();
-            if (widened == 0x84) { // iinc：u2 槽位 + s2 增量
-                insn.opcode = widened;
-                insn.a = r.u2();
-                insn.b = r.s2();
-            } else if ((widened >= 0x15 && widened <= 0x19) || (widened >= 0x36 && widened <= 0x3a)) {
-                insn.opcode = widened;
-                insn.a = r.u2();
-            } else {
-                throw std::runtime_error("wide 形态 demo 未桥接");
+        Insn ji;
+        ji.opcode = static_cast<u8>(in->op);
+
+        if (isLdcFamily(in->op)) {
+            auto mapped = cpToLocal.find(in->cp);
+            if (mapped == cpToLocal.end()) {
+                CpEntry entry;
+                if (!appendCpEntry(cp, in->cp, entry)) return fail("ldc 常量种类未桥接");
+                const auto local = static_cast<ca::i32>(out.cp.size());
+                out.cp.push_back(std::move(entry));
+                mapped = cpToLocal.emplace(in->cp, local).first;
             }
-            break;
+            ji.a = mapped->second;
+            out.code.push_back(ji);
+            continue;
         }
-        default: break; // 无操作数指令（常量/栈操作/算术/转换/比较/返回/数组/monitor…）
-        }
-        out.push_back(insn);
-    }
-    return out;
-}
 
-/// 描述符返回段 → SimValue 类型；V 置 hasReturn=false。
-ValType returnTypeOf(std::string_view desc, bool& hasReturn) {
-    const usize close = desc.rfind(')');
-    const std::string_view ret = close == std::string_view::npos ? desc : desc.substr(close + 1);
-    hasReturn = !(ret == "V");
-    if (ret.empty()) throw std::runtime_error("描述符返回段为空");
-    switch (ret[0]) {
-    case 'B': case 'C': case 'S': case 'Z': case 'I': return ValType::I32;
-    case 'J': return ValType::I64;
-    case 'F': return ValType::F32;
-    case 'D': return ValType::F64;
-    default: return ValType::Ref; // L...; / [
-    }
-}
-
-/// 字段描述符整体 → SimValue 类型。
-ValType fieldTypeOf(std::string_view desc) {
-    bool unused = false;
-    return returnTypeOf("(" + std::string(desc), unused); // 复用返回段解析
-}
-
-/// RawInsn → jsim::Method。跳转/分支的 a 从字节偏移重映射成指令下标；ldc 与
-/// invoke/new 的常量池引用搬进 Method 自带的 cp/calls/fields/allocTypes 侧表。
-Method translateMethod(const ClassFile& cf, const MethodInfo& mi) {
-    const std::vector<RawInsn> raw = walkCode(mi.code);
-    std::unordered_map<u32, u32> indexAt;
-    for (u32 i = 0; i < raw.size(); ++i) indexAt[raw[i].offset] = i;
-
-    Method m;
-    m.name = mi.name;
-    m.desc = mi.desc;
-    m.maxLocals = mi.maxLocals;
-
-    for (const RawInsn& insn : raw) {
-        const auto emit = [&](i32 a = 0, i32 b = 0) { m.code.push_back({insn.opcode, a, b}); };
-        const auto targetIndex = [&]() -> i32 {
-            const auto it = indexAt.find(insn.offset + static_cast<u32>(insn.a));
-            if (it == indexAt.end()) throw std::runtime_error("跳转目标不对齐指令边界");
-            return static_cast<i32>(it->second);
-        };
-
-        switch (insn.opcode) {
-        // ldc 家族：常量池条目搬进 Method.cp，按条目种类定型。
-        case op::Ldc: case op::LdcW: case op::Ldc2W: {
-            const CpInfo& src = cf.cp.at(static_cast<usize>(insn.a));
-            CpEntry entry;
-            switch (src.tag) {
-            case 8: entry.kind = CpEntry::Kind::Str; entry.strValue = unitsToSimStr(decodeMutf8(cf.utf8At(src.a))); break;
-            case 3: entry.kind = CpEntry::Kind::Int; entry.intValue = src.intValue; break;
-            case 4: entry.kind = CpEntry::Kind::Float; entry.intValue = src.intValue; break; // 位型
-            case 5: entry.kind = CpEntry::Kind::Long; entry.longValue = src.longValue; break;
-            case 6: entry.kind = CpEntry::Kind::Double; entry.longValue = src.longValue; break; // 位型
-            case 7: entry.kind = CpEntry::Kind::Class; entry.className = cf.classNameAt(static_cast<u16>(insn.a)); break;
-            default: throw std::runtime_error("ldc 常量池条目种类 demo 未桥接");
-            }
-            m.cp.push_back(std::move(entry));
-            emit(static_cast<i32>(m.cp.size()) - 1);
-            break;
-        }
-        // 调用族：Methodref → CallRef（isStatic 由 opcode 决定，引擎按它弹参）。
-        case op::InvokeVirtual: case op::InvokeSpecial: case op::InvokeStatic:
-        case op::InvokeInterface: {
-            const ClassFile::MemberRef ref = cf.methodRefAt(static_cast<u16>(insn.a));
+        switch (in->op) {
+        case jbc::core::Op::INVOKEVIRTUAL:
+        case jbc::core::Op::INVOKESPECIAL:
+        case jbc::core::Op::INVOKESTATIC:
+        case jbc::core::Op::INVOKEINTERFACE: {
             CallRef call;
-            call.owner = ref.owner;
-            call.name = ref.name;
-            call.desc = ref.desc;
-            call.retType = returnTypeOf(ref.desc, call.hasReturn);
-            call.isStatic = insn.opcode == op::InvokeStatic;
-            m.calls.push_back(std::move(call));
-            emit(static_cast<i32>(m.calls.size()) - 1);
+            if (!memberRefOf(cp, in->cp, call.owner, call.name, call.desc)) {
+                return fail("调用点引用解析失败");
+            }
+            bool hasRet = true;
+            if (!retTypeOfDesc(call.desc, call.retType, hasRet)) {
+                return fail("调用点描述符不可解析");
+            }
+            call.hasReturn = hasRet;
+            call.isStatic = in->op == jbc::core::Op::INVOKESTATIC;
+            ji.a = static_cast<i32>(out.calls.size());
+            out.calls.push_back(std::move(call));
             break;
         }
-        // 字段族：Fieldref → FieldRef（值类型由描述符决定）。
-        case op::GetStatic: case op::PutStatic: case op::GetField: case op::PutField: {
-            const ClassFile::MemberRef ref = cf.methodRefAt(static_cast<u16>(insn.a));
+        case jbc::core::Op::GETSTATIC:
+        case jbc::core::Op::PUTSTATIC:
+        case jbc::core::Op::GETFIELD:
+        case jbc::core::Op::PUTFIELD: {
             FieldRef field;
-            field.owner = ref.owner;
-            field.name = ref.name;
-            field.desc = ref.desc;
-            field.type = fieldTypeOf(ref.desc);
-            m.fields.push_back(std::move(field));
-            emit(static_cast<i32>(m.fields.size()) - 1);
+            if (!memberRefOf(cp, in->cp, field.owner, field.name, field.desc)) {
+                return fail("字段引用解析失败");
+            }
+            if (!fieldTypeOfDesc(field.desc, field.type)) return fail("字段类型不支持");
+            ji.a = static_cast<i32>(out.fields.size());
+            out.fields.push_back(std::move(field));
             break;
         }
-        case op::New: // new：类名进 allocTypes，分配语义由 allocScaffolds 提供
-            m.allocTypes.push_back(cf.classNameAt(static_cast<u16>(insn.a)));
-            emit(static_cast<i32>(m.allocTypes.size()) - 1);
+        case jbc::core::Op::NEW:
+        case jbc::core::Op::ANEWARRAY: {
+            std::string cls = classNameOf(cp, in->cp);
+            if (cls.empty()) return fail("类常量解析失败");
+            ji.a = static_cast<i32>(out.allocTypes.size());
+            out.allocTypes.push_back(std::move(cls));
             break;
-        case op::ANewArray: // anewarray：CP 类名即元素类型（引擎自加前缀 [）
-            m.allocTypes.push_back(cf.classNameAt(static_cast<u16>(insn.a)));
-            emit(static_cast<i32>(m.allocTypes.size()) - 1);
-            break;
-        case op::MultiANewArray: { // multianewarray：剥掉 dims 个 [ 得元素类型
-            std::string cls = cf.classNameAt(static_cast<u16>(insn.a));
-            const usize dims = static_cast<usize>(insn.b);
+        }
+        case jbc::core::Op::MULTIANEWARRAY: {
+            // libjbc：cp = 类常量（含全部 '['），a = 维数；jsim 侧要元素类型
+            //（剥掉 dims 个 '['）+ b = 维数。
+            std::string cls = classNameOf(cp, in->cp);
+            const auto dims = static_cast<usize>(in->a);
             bool leadingBrackets = cls.size() >= dims;
             for (usize k = 0; k < dims; ++k) leadingBrackets = leadingBrackets && cls[k] == '[';
-            if (!leadingBrackets) {
-                throw std::runtime_error("multianewarray 类名与维数不符");
-            }
-            m.allocTypes.push_back(cls.substr(dims));
-            emit(static_cast<i32>(m.allocTypes.size()) - 1, insn.b);
+            if (cls.empty() || !leadingBrackets) return fail("multianewarray 类名与维数不符");
+            ji.a = static_cast<i32>(out.allocTypes.size());
+            out.allocTypes.push_back(cls.substr(dims));
+            ji.b = in->a;
             break;
         }
-        // checkcast/instanceof：引擎默认按恒等/Unknown 处理，操作数无需落位。
-        case op::CheckCast: case op::InstanceOf:
-            emit();
+        case jbc::core::Op::CHECKCAST:
+        case jbc::core::Op::INSTANCEOF:
+            // jsim 默认语义：checkcast 恒等 / instanceof 压 Unknown，操作数无需落位。
             break;
-        // 分支与跳转：字节偏移 → 指令下标。
-        case op::IfEq: case op::IfNe: case op::IfLt: case op::IfGe: case op::IfGt:
-        case op::IfLe: case op::IfIcmpeq: case op::IfIcmpne: case op::IfIcmplt:
-        case op::IfIcmpge: case op::IfIcmpgt: case op::IfIcmple: case op::IfAcmpeq:
-        case op::IfAcmpne: case op::IfNull: case op::IfNonNull:
-            emit(targetIndex());
+        case jbc::core::Op::NEWARRAY:
+            // libjbc 把 atype 放在 a；jsim 的 newarray 读 b（MethodBuilder 同口径）。
+            ji.a = 0;
+            ji.b = in->a;
             break;
-        case op::Goto:
-            emit(targetIndex());
+        case jbc::core::Op::GOTO:
+        case jbc::core::Op::IFEQ:
+        case jbc::core::Op::IFNE:
+        case jbc::core::Op::IFLT:
+        case jbc::core::Op::IFGE:
+        case jbc::core::Op::IFGT:
+        case jbc::core::Op::IFLE:
+        case jbc::core::Op::IF_ICMPEQ:
+        case jbc::core::Op::IF_ICMPNE:
+        case jbc::core::Op::IF_ICMPLT:
+        case jbc::core::Op::IF_ICMPGE:
+        case jbc::core::Op::IF_ICMPGT:
+        case jbc::core::Op::IF_ICMPLE:
+        case jbc::core::Op::IF_ACMPEQ:
+        case jbc::core::Op::IF_ACMPNE:
+        case jbc::core::Op::IFNULL:
+        case jbc::core::Op::IFNONNULL: {
+            ca::usize target = 0;
+            if (!resolveLabelPc(in->target, target)) return fail("分支目标解析失败");
+            ji.a = static_cast<i32>(target);
             break;
+        }
         default:
-            // 其余（常量/装载存储/算术/转换/栈操作/iinc/newarray/返回/athrow/
-            // monitor）操作数原样透传，jsim 效应表已有语义。
-            emit(insn.a, insn.b);
+            if (in->op == jbc::core::Op::INVOKEDYNAMIC || in->op == jbc::core::Op::TABLESWITCH
+                || in->op == jbc::core::Op::LOOKUPSWITCH || in->op == jbc::core::Op::JSR
+                || in->op == jbc::core::Op::JSR_W || in->op == jbc::core::Op::RET
+                || in->op == jbc::core::Op::ATHROW) {
+                return fail("指令族未桥接（合成样本未出现）");
+            }
+            // 常量/装载存储/算术/转换/栈操作/iinc：a/b 原样搬运。
+            ji.a = in->a;
+            ji.b = in->b;
             break;
         }
+
+        out.code.push_back(ji);
     }
-    return m;
+    return true;
 }
 
-// ───────────────────────── 调用点扫描 ─────────────────────────
-
-struct CallSite {
-    std::string method;  ///< 调用点所在方法名
-    std::string cipher;  ///< ldc 密文（jsim UTF-8 码元串）
-};
-
-/// 形态匹配：ldc(String) 紧邻 invokestatic 解密器（owner/name/desc 全等）。
-std::vector<CallSite> scanCallSites(const ClassFile& cf, const std::string& owner,
-                                    const std::string& name, const std::string& desc) {
-    std::vector<CallSite> sites;
-    for (const MethodInfo& mi : cf.methods) {
-        if (mi.name == name && mi.desc == desc) continue; // 解密器自身不含调用点
-        const std::vector<RawInsn> raw = walkCode(mi.code);
-        for (usize i = 0; i + 1 < raw.size(); ++i) {
-            const bool isLdcStr = (raw[i].opcode == op::Ldc || raw[i].opcode == op::LdcW) &&
-                                  cf.cp.at(static_cast<usize>(raw[i].a)).tag == 8;
-            if (!isLdcStr || raw[i + 1].opcode != op::InvokeStatic) continue;
-            const ClassFile::MemberRef callee = cf.methodRefAt(static_cast<u16>(raw[i + 1].a));
-            if (callee.owner != owner || callee.name != name || callee.desc != desc) continue;
-            const std::string& mutf8 = cf.utf8At(cf.cp.at(static_cast<usize>(raw[i].a)).a);
-            sites.push_back({mi.name, unitsToSimStr(decodeMutf8(mutf8))});
-        }
-    }
-    return sites;
-}
+} // namespace bridge
 
 // ───────────────────────── 解密器模拟还原 ─────────────────────────
 
@@ -653,6 +543,147 @@ Session makeSession() {
     return session;
 }
 
+// ───────────────────── 调用点扫描与解密器引用统计（libjbc 会话面） ─────────────────────
+
+/// 一个调用点：相邻指令对 ldc(String 密文) → invokestatic 解密器。
+struct CallSite {
+    std::string method;             ///< 调用点所在方法名
+    ca::usize methodIdx = 0;        ///< ClassUnit 下标（改写与 lower 用）
+    jbc::ir::CodeUnitRef unit;      /// promote 保活（改写直接在这个 IR 上做）
+    jbc::ir::InsnId ldc{};          ///< 密文 ldc 句柄
+    jbc::ir::InsnId invoke{};       ///< 紧邻 invokestatic 句柄
+    std::string cipher;             ///< 密文（MUTF-8 原样透传给 jsim 载荷）
+    u32 pairBytes = 0;              ///< 原指令对字节数（ldc 2/3 + invokestatic 3）
+};
+
+/// 形态匹配：ldc(String) 紧邻 invokestatic 解密器（owner=本类 + name + desc 全等）。
+std::vector<CallSite> scanCallSites(jbc::ir::ClassSession& s, const std::string& decryptName,
+                                    const std::string& decryptDesc) {
+    std::vector<CallSite> sites;
+    const std::string thisName{s.backing().thisName()};
+    const jbc::ir::ClassUnit& unit = s.unit();
+    for (ca::usize m = 0; m < unit.methods.size(); ++m) {
+        if (unit.symbols().str(unit.methods[m].name) == decryptName
+            && unit.symbols().str(unit.methods[m].desc) == decryptDesc) {
+            continue; // 解密器自身不含调用点
+        }
+        if (!jbc::ir::hasCode(s, m)) continue;
+        auto promoted = jbc::ir::promoteMethod(s, m);
+        if (promoted.is_err()) continue;
+        jbc::ir::CodeUnitRef cu = promoted.unwrap();
+        const std::vector<jbc::ir::InsnId>& order = cu->dom.order();
+        for (ca::usize i = 0; i + 1 < order.size(); ++i) {
+            const jbc::ir::Insn* ldcInsn = cu->dom.peek(order[i]);
+            const jbc::ir::Insn* invInsn = cu->dom.peek(order[i + 1]);
+            if (ldcInsn == nullptr || invInsn == nullptr) continue;
+            if (!bridge::isLdcFamily(ldcInsn->op) || invInsn->op != jbc::core::Op::INVOKESTATIC) {
+                continue;
+            }
+            jbc::ir::ClassSession::ConstSem cst;
+            if (!s.constOf(*ldcInsn, cst) || cst.kind != jbc::ir::ClassSession::ConstSem::Kind::String) {
+                continue;
+            }
+            jbc::ir::ClassSession::MemberSem mem;
+            if (!s.memberOf(*invInsn, mem) || mem.owner != thisName || mem.name != decryptName
+                || mem.desc != decryptDesc) {
+                continue;
+            }
+            CallSite site;
+            site.method = std::string(unit.symbols().str(unit.methods[m].name));
+            site.methodIdx = m;
+            site.unit = cu;
+            site.ldc = order[i];
+            site.invoke = order[i + 1];
+            site.cipher = std::string(cst.str);
+            site.pairBytes = (ldcInsn->op == jbc::core::Op::LDC ? 2u : 3u) + 3u;
+            sites.push_back(std::move(site));
+        }
+    }
+    return sites;
+}
+
+/// 全类统计仍指向解密器的调用指令数（改写后应为 0——含未被形态匹配的引用）。
+ca::usize countDecryptReferences(jbc::ir::ClassSession& s, const std::string& decryptName,
+                                 const std::string& decryptDesc) {
+    ca::usize count = 0;
+    const std::string thisName{s.backing().thisName()};
+    const jbc::ir::ClassUnit& unit = s.unit();
+    for (ca::usize m = 0; m < unit.methods.size(); ++m) {
+        if (!jbc::ir::hasCode(s, m)) continue;
+        auto promoted = jbc::ir::promoteMethod(s, m);
+        if (promoted.is_err()) continue;
+        jbc::ir::CodeUnitRef cu = promoted.unwrap();
+        for (const jbc::ir::InsnId id : cu->dom.order()) {
+            const jbc::ir::Insn* in = cu->dom.peek(id);
+            if (in == nullptr) continue;
+            if (in->op != jbc::core::Op::INVOKESTATIC && in->op != jbc::core::Op::INVOKEVIRTUAL
+                && in->op != jbc::core::Op::INVOKESPECIAL
+                && in->op != jbc::core::Op::INVOKEINTERFACE) {
+                continue;
+            }
+            jbc::ir::ClassSession::MemberSem mem;
+            if (s.memberOf(*in, mem) && mem.owner == thisName && mem.name == decryptName
+                && mem.desc == decryptDesc) {
+                ++count;
+            }
+        }
+    }
+    return count;
+}
+
+// ───────────────────── 导出：jar 打包与读回 ─────────────────────
+
+/// 打包：定位 JDK 的 jar 工具（libjzip 写面是逐头手填型——CRC/时间戳自填，
+/// 不顺手；按许可回落家族工具链）。
+bool packJar(const fs::path& jarTool, const fs::path& classesDir, const std::string& entryName,
+             const fs::path& outJar) {
+    std::error_code ec;
+    fs::remove(outJar, ec);
+    const std::string cmd = "\"" + jarTool.string() + "\" --create --file \"" + outJar.string()
+                            + "\" -C \"" + classesDir.string() + "\" " + entryName;
+#if defined(_WIN32)
+    const int rc = std::system(("\"" + cmd + "\"").c_str());
+#else
+    const int rc = std::system(cmd.c_str());
+#endif
+    if (rc != 0) {
+        std::printf("jar 打包退出码 %d\n", rc);
+        return false;
+    }
+    return fs::exists(outJar);
+}
+
+/// 读回：libjzip 的 JvmZipReader（JVM 语义读面）取指定条目字节。
+std::vector<u8> readJarEntry(const fs::path& jar, const std::string& entryName, std::string& why) {
+    bool ok = false;
+    const std::vector<u8> jarBytes = readFileBytes(jar, ok);
+    if (!ok) {
+        why = "jar 文件读取失败";
+        return {};
+    }
+    try {
+        jzip::ZipArchive archive;
+        jzip::JvmZipReader reader;
+        reader.read(archive, jzip::MemorySegment{jarBytes});
+        const jzip::LocalFileHeader* entry = archive.getLocalFileByName(entryName);
+        if (entry == nullptr) {
+            why = "jar 内无条目 " + entryName;
+            return {};
+        }
+        if (entry->getCompressionMethod() != 8) {
+            why = "条目非 deflated（jar 默认压缩，此形态不应出现）";
+            return {};
+        }
+        jzip::DeflateDecompressor dec;
+        return entry->decompress(dec);
+    } catch (const std::exception& e) {
+        why = std::string("libjzip 读取异常：") + e.what();
+        return {};
+    }
+}
+
+// ───────────────────────── 真 JVM 对拍 ─────────────────────────
+
 struct Expectation {
     const char* method;
     const char* plain; ///< 明文（UTF-8），与 JsimObfSample.PLAINS 一一对应
@@ -665,85 +696,119 @@ const Expectation kExpectations[] = {
     {"solo", "灯"},                          // 单码元边界
 };
 
+/// 跑 main 类并捕获 stdout（stderr 分流，不污染对拍字节）。
+bool runJavaCapture(const fs::path& javaExe, const std::string& cpArg, const fs::path& outFile,
+                    const fs::path& errFile) {
+    const std::string cmd = "\"" + javaExe.string() + "\" -Dfile.encoding=UTF-8 -cp \"" + cpArg
+                            + "\" JsimObfSample > \"" + outFile.string() + "\" 2> \""
+                            + errFile.string() + "\"";
+#if defined(_WIN32)
+    const int rc = std::system(("\"" + cmd + "\"").c_str());
+#else
+    const int rc = std::system(cmd.c_str());
+#endif
+    return rc == 0;
+}
+
+/// 期望输出：kExpectations 逐行（println 用平台行分隔符）。
+std::string expectedJvmOutput() {
+#if defined(_WIN32)
+    static const char* nl = "\r\n";
+#else
+    static const char* nl = "\n";
+#endif
+    std::string out;
+    for (const Expectation& e : kExpectations) {
+        out += e.plain;
+        out += nl;
+    }
+    return out;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
 #if defined(_WIN32)
     SetConsoleOutputCP(CP_UTF8); // 源码字面量是 UTF-8，报告含非 ASCII 明文
 #endif
-    std::printf("[jsim-demo-deobf] 静态 deobf：javac 现场编译 + classfile 自备桥 + 解密器模拟还原\n");
+    std::printf("[jsim-demo-deobf] 静态 deobf：libjbc 解析改写 + jsim 模拟还原 + 导出与双查验\n");
 
-    // 1. 定位源码 + 现场编译。
+    // ── 1. 定位源码与 JDK 工具，现场编译 ──
     fs::path src = locateSampleSource(argc > 0 ? argv[0] : "");
     if (src.empty()) {
         std::printf("找不到 demo/deobf/java/JsimObfSample.java（CWD 与可执行文件目录均未命中）\n");
         return 1;
     }
     std::error_code canonicalEc;
-    src = fs::weakly_canonical(src, canonicalEc); // 转绝对路径，交给 javac 前钉死
+    src = fs::weakly_canonical(src, canonicalEc);
     std::printf("样本源码：%s\n", src.string().c_str());
-    const fs::path javac = locateJavac();
-    if (javac.empty()) return 1;
+
+    const JdkTools tools = locateJdkTools();
+    if (tools.javac.empty()) return 1;
+
     const fs::path outDir = fs::temp_directory_path() / "jsim-demo-deobf";
-    if (!compileSample(javac, src, outDir)) return 1;
+    const fs::path deobfDir = outDir / "deobfed";
+    const fs::path origClass = outDir / "JsimObfSample.class";
+    const fs::path deobfClass = deobfDir / "JsimObfSample.class";
+    const fs::path deobfJar = deobfDir / "jsimobf-deobfed.jar";
+    if (!compileSample(tools.javac, src, outDir)) return 1;
 
-    // 2. 读 class + 最小面解析。
-    std::vector<u8> bytes;
-    {
-        FILE* f = std::fopen((outDir / "JsimObfSample.class").string().c_str(), "rb");
-        if (f == nullptr) {
-            std::printf("编译产物 JsimObfSample.class 不存在（javac 输出命名异常）\n");
-            return 1;
-        }
-        std::fseek(f, 0, SEEK_END);
-        const long size = std::ftell(f);
-        std::fseek(f, 0, SEEK_SET);
-        bytes.resize(static_cast<usize>(size));
-        const usize got = size > 0 ? std::fread(bytes.data(), 1, bytes.size(), f) : 0;
-        std::fclose(f);
-        if (got != bytes.size()) {
-            std::printf("JsimObfSample.class 读取不完整\n");
-            return 1;
-        }
-    }
-    const ClassFile cf = parseClass(bytes);
-    std::printf("解析：%s（class v%u，%zu 个方法）\n", cf.thisClass.c_str(), cf.major,
-                cf.methods.size());
-    expect(cf.major == 52, "编译代次为 Java 8（class v52）");
-
-    // 3. 找解密器并桥接（按自起名 + 签名定位；解密器是静态 (Object)String）。
-    const MethodInfo* decryptor = nullptr;
-    for (const MethodInfo& mi : cf.methods) {
-        if (mi.name == "decrypt" && mi.desc == "(Ljava/lang/Object;)Ljava/lang/String;" &&
-            (mi.access & 0x0008) != 0) {
-            decryptor = &mi;
-        }
-    }
-    if (decryptor == nullptr) {
-        std::printf("未找到静态解密器 decrypt(Ljava/lang/Object;)Ljava/lang/String;\n");
+    bool readOk = false;
+    const std::vector<u8> origBytes = readFileBytes(origClass, readOk);
+    if (!readOk) {
+        std::printf("编译产物 JsimObfSample.class 读取失败\n");
         return 1;
     }
-    const Method method = translateMethod(cf, *decryptor);
-    std::printf("解密器：decrypt(Ljava/lang/Object;)Ljava/lang/String;，%zu 条指令，maxLocals=%u\n",
-                method.code.size(), method.maxLocals);
 
-    // 4. 指令形态核对（与合成样本声明的混淆模式对齐）。
+    // ── 2. libjbc 建会话，定位解密器 ──
+    auto sessionRes = jbc::ir::makeSessionFromBytes(jbc::core::ByteView{origBytes});
+    if (sessionRes.is_err()) {
+        std::printf("libjbc 建会话失败（stage=%d）\n",
+                    static_cast<int>(sessionRes.unwrap_err().stage));
+        return 1;
+    }
+    std::shared_ptr<jbc::ir::ClassSession> session = sessionRes.unwrap();
+    const std::string thisName{session->backing().thisName()};
+    std::printf("解析（libjbc）：%s（class v%u，%zu 个方法）\n", thisName.c_str(),
+                session->backing().major, session->unit().methods.size());
+    expect(session->backing().major == 52, "编译代次为 Java 8（class v52）");
+
+    const std::string kDecryptName = "decrypt";
+    const std::string kDecryptDesc = "(Ljava/lang/Object;)Ljava/lang/String;";
+    const ca::usize decryptIdx = session->unit().findMethod(kDecryptName, kDecryptDesc);
+    if (decryptIdx == jbc::ir::kNoMethod) {
+        std::printf("未找到解密器 %s%s\n", kDecryptName.c_str(), kDecryptDesc.c_str());
+        return 1;
+    }
+    const jbc::ir::MethodId decryptId = session->unit().methods[decryptIdx].id;
+    std::printf("解密器：%s%s%s\n", thisName.c_str(), kDecryptName.c_str(), kDecryptDesc.c_str());
+
+    // ── 3. 消费方桥：解密器 CodeUnit → jsim::Method，指令形态核对 ──
+    Method simMethod;
+    std::string bridgeWhy;
+    if (!bridge::toSimMethod(*session, decryptIdx, simMethod, bridgeWhy)) {
+        std::printf("桥接失败：%s\n", bridgeWhy.c_str());
+        return 1;
+    }
+    std::printf("桥接（CodeUnit → jsim::Method）：%zu 条指令，maxLocals=%u\n",
+                simMethod.code.size(), simMethod.maxLocals);
+
     bool hasNewArrayChar = false;
     bool hasCastore = false;
     bool hasStringCtor = false;
     bool hasBackJump = false;
-    for (u32 i = 0; i < method.code.size(); ++i) {
-        const Insn& insn = method.code[i];
+    for (u32 i = 0; i < simMethod.code.size(); ++i) {
+        const Insn& insn = simMethod.code[i];
         if (insn.opcode == op::NewArray && insn.b == 5) hasNewArrayChar = true; // newarray char
         if (insn.opcode == op::CAStore) hasCastore = true;
         if (insn.opcode == op::InvokeSpecial) {
-            const CallRef& call = method.calls.at(static_cast<usize>(insn.a));
+            const CallRef& call = simMethod.calls.at(static_cast<usize>(insn.a));
             if (call.owner == "java/lang/String" && call.name == "<init>" && call.desc == "([C)V") {
                 hasStringCtor = true;
             }
         }
-        const bool isJump = insn.opcode == op::Goto ||
-                            (insn.opcode >= op::IfEq && insn.opcode <= op::IfAcmpne);
+        const bool isJump = insn.opcode == op::Goto
+                            || (insn.opcode >= op::IfEq && insn.opcode <= op::IfAcmpne);
         if (isJump && static_cast<u32>(insn.a) < i) hasBackJump = true;
     }
     expect(hasNewArrayChar, "形态：newarray char（char[] 写回）");
@@ -751,15 +816,14 @@ int main(int argc, char** argv) {
     expect(hasStringCtor, "形态：new String(char[]) 构造收尾");
     expect(hasBackJump, "形态：回边（逆序循环）");
 
-    // 5. 扫描调用点密文。
-    const std::vector<CallSite> sites = scanCallSites(cf, cf.thisClass, "decrypt",
-                                                      "(Ljava/lang/Object;)Ljava/lang/String;");
-    std::printf("调用点（ldc 密文 → invokestatic decrypt）：%zu 处\n", sites.size());
+    // ── 4. 扫描调用点，逐站点模拟还原 ──
+    std::vector<CallSite> sites = scanCallSites(*session, kDecryptName, kDecryptDesc);
+    std::printf("调用点（ldc 密文 → invokestatic 解密器）：%zu 处\n", sites.size());
     expect(sites.size() == sizeof(kExpectations) / sizeof(kExpectations[0]),
-           "调用点数与期望表一致（" + std::to_string(sizeof(kExpectations) / sizeof(kExpectations[0])) + " 处）");
+           "调用点数与期望表一致（"
+               + std::to_string(sizeof(kExpectations) / sizeof(kExpectations[0])) + " 处）");
 
-    // 6. 逐站点：密文灌成 ldc 字面量（internedStr），跑解密器，断言明文。
-    usize index = 0;
+    std::vector<std::string> recoveredPlain; // 与 sites 一一对应，改写复用
     for (const CallSite& site : sites) {
         const Expectation* want = nullptr;
         for (const Expectation& e : kExpectations) {
@@ -767,44 +831,203 @@ int main(int argc, char** argv) {
         }
         std::printf("  站点 %s：%s\n", site.method.c_str(), escapeCipher(site.cipher).c_str());
 
-        Session session = makeSession();
+        Session jsimSession = makeSession();
         Prefill prefill;
-        prefill.locals = {SimValue::internedStr(site.cipher)}; // 密文来自 ldc 字面量
-        RunResult r = Sim(method, session).runEntry(std::move(prefill), 1u << 16);
+        // 密文来自 ldc 字面量：带常量池 intern 身份事实；字节为 MUTF-8 原样透传。
+        prefill.locals = {SimValue::internedStr(site.cipher)};
+        RunResult r = Sim(simMethod, jsimSession).runEntry(std::move(prefill), 1u << 16);
 
         std::string recovered;
-        bool completed = r.kind == RunResult::Kind::Completed && r.hasReturnValue &&
-                         r.returnValue.known && r.returnValue.ref.kind == RefPayload::Kind::Obj;
+        bool completed = r.kind == RunResult::Kind::Completed && r.hasReturnValue
+                         && r.returnValue.known && r.returnValue.ref.kind == RefPayload::Kind::Obj;
         if (completed) {
-            const auto it = session.heap.find(r.returnValue.ref.objId);
-            if (it != session.heap.end()) recovered = it->second.data;
+            const auto it = jsimSession.heap.find(r.returnValue.ref.objId);
+            if (it != jsimSession.heap.end()) recovered = it->second.data;
             else completed = false;
         }
         std::printf("    还原：\"%s\"（", recovered.c_str());
         printResult(r);
         std::printf("）\n");
+        recoveredPlain.push_back(recovered);
         if (!completed) {
             expect(false, site.method + "：解密器未正常返回字符串");
-            ++index;
             continue;
         }
         if (want == nullptr) {
             expect(false, site.method + "：无对应期望条目");
-            ++index;
             continue;
         }
         std::printf("    期望：\"%s\"\n", want->plain);
         expect(recovered == want->plain,
                std::string(site.method) + "：明文 == 期望（" + want->plain + "）");
-        ++index;
     }
 
-    // 7. 汇总。
+    // ── 5. libjbc 模型层改写：密文对 → ldc 明文，摘除解密器，导出 class ──
+    std::printf("改写（libjbc 模型层）：\n");
+    bool rewriteOk = true;
+    std::vector<ca::usize> touchedMethods;
+    i64 pairBytesTotal = 0;
+    i64 replBytesTotal = 0;
+    for (usize k = 0; k < sites.size(); ++k) {
+        CallSite& site = sites[k];
+        const std::string& plain = recoveredPlain[k];
+        auto ldcGot = site.unit->dom.get(site.ldc);
+        if (ldcGot.is_err()) {
+            std::printf("  取 ldc 句柄失败：%s\n", jbc::ir::to_string(ldcGot.unwrap_err()));
+            rewriteOk = false;
+            break;
+        }
+        // setString：CP 追加明文 String（intern 去重），索引超 u1 域自动升格 ldc→ldc_w。
+        if (!session->setString(*ldcGot.unwrap(), plain)) {
+            std::printf("  setString 失败（站点 %s）\n", site.method.c_str());
+            rewriteOk = false;
+            break;
+        }
+        // erase invokestatic：仍被引用会拒绝（StillUsed），此处调用点不可能被引用。
+        auto erased = site.unit->dom.erase(site.invoke);
+        if (erased.is_err()) {
+            std::printf("  erase invokestatic 失败：%s\n", jbc::ir::to_string(erased.unwrap_err()));
+            rewriteOk = false;
+            break;
+        }
+        const jbc::ir::Insn* replaced = site.unit->dom.peek(site.ldc);
+        const u32 replBytes = replaced != nullptr && replaced->op == jbc::core::Op::LDC ? 2u : 3u;
+        pairBytesTotal += static_cast<i64>(site.pairBytes);
+        replBytesTotal += static_cast<i64>(replBytes);
+        std::printf("  %s：%lluB（ldc %uB + invokestatic 3B）→ ldc 明文 %uB，净 %+lldB\n",
+                    site.method.c_str(), static_cast<unsigned long long>(site.pairBytes),
+                    site.pairBytes - 3u, replBytes,
+                    static_cast<long long>(replBytes) - static_cast<long long>(site.pairBytes));
+        bool known = false;
+        for (ca::usize m : touchedMethods) known = known || m == site.methodIdx;
+        if (!known) touchedMethods.push_back(site.methodIdx);
+    }
+    expect(rewriteOk, "模型层改写全部成功（" + std::to_string(sites.size()) + " 对）");
+    if (!rewriteOk) {
+        std::printf("断言 %d/%d 通过\n", gChecks - gFailures, gChecks);
+        return 1;
+    }
+
+    // lower：偏移与 StackMapTable/LineNumberTable 重定位由 libjbc 序列化机制负责。
+    for (ca::usize m : touchedMethods) {
+        auto lowered = jbc::ir::lowerMethod(*session, m);
+        if (lowered.is_err()) {
+            std::printf("lowerMethod 失败：%s\n", jbc::ir::to_string(lowered.unwrap_err()));
+            return 1;
+        }
+    }
+    // 摘除解密器（其 CP 引用条目留着无害；调用点已清零）。
+    auto removed = session->removeMethod(decryptId);
+    if (removed.is_err()) {
+        std::printf("removeMethod 失败：%s\n", jbc::ir::to_string(removed.unwrap_err()));
+        return 1;
+    }
+
+    auto written = jbc::core::writeClass(session->backing());
+    if (written.is_err()) {
+        std::printf("writeClass 失败：%s\n", jbc::core::to_string(written.unwrap_err()));
+        return 1;
+    }
+    const std::vector<ca::u8> deobfBytes = written.unwrap();
+    if (!writeFileBytes(deobfClass, deobfBytes)) {
+        std::printf("导出 class 写盘失败：%s\n", deobfClass.string().c_str());
+        return 1;
+    }
+    std::printf("导出 class：%s（%zuB；原 %zuB，指令对 %lldB→%lldB）\n",
+                deobfClass.string().c_str(), deobfBytes.size(), origBytes.size(), pairBytesTotal,
+                replBytesTotal);
+
+    // ── 6. jar 打包（JDK jar 工具）──
+    if (!packJar(tools.jar, deobfDir, "JsimObfSample.class", deobfJar)) {
+        std::printf("断言 %d/%d 通过\n", gChecks - gFailures, gChecks);
+        return 1;
+    }
+    std::printf("导出 jar：%s\n", deobfJar.string().c_str());
+
+    // ── 7. 查验 A：libjzip 读回 jar，libjbc 重开结构对拍 ──
+    std::string readWhy;
+    const std::vector<u8> jarEntry = readJarEntry(deobfJar, "JsimObfSample.class", readWhy);
+    expect(!jarEntry.empty(), "结构：jar 条目可读（libjzip）——" + readWhy);
+    if (jarEntry.empty()) {
+        std::printf("断言 %d/%d 通过\n", gChecks - gFailures, gChecks);
+        return 1;
+    }
+    expect(jarEntry == deobfBytes, "结构：jar 条目与导出 class 逐字节一致");
+
+    auto reopenRes = jbc::ir::makeSessionFromBytes(jbc::core::ByteView{jarEntry});
+    if (reopenRes.is_err()) {
+        std::printf("重开导出 class 失败\n");
+        return 1;
+    }
+    std::shared_ptr<jbc::ir::ClassSession> reopened = reopenRes.unwrap();
+    expect(reopened->backing().state() == jbc::core::ParseState::Validated,
+           "结构：导出 class 可完整解析（无降级）");
+    expect(reopened->unit().findMethod(kDecryptName, kDecryptDesc) == jbc::ir::kNoMethod,
+           "结构：解密器方法已摘除");
+    expect(scanCallSites(*reopened, kDecryptName, kDecryptDesc).empty(),
+           "结构：密文调用点清零（ldc→invokestatic 形态为 0）");
+    expect(countDecryptReferences(*reopened, kDecryptName, kDecryptDesc) == 0,
+           "结构：解密器引用清零（全部 invoke 形态为 0）");
+
+    for (const Expectation& e : kExpectations) {
+        const ca::usize m = reopened->unit().findMethod(e.method);
+        bool plainInPlace = false;
+        if (m != jbc::ir::kNoMethod && jbc::ir::hasCode(*reopened, m)) {
+            auto promoted = jbc::ir::promoteMethod(*reopened, m);
+            if (!promoted.is_err()) {
+                jbc::ir::CodeUnitRef cu = promoted.unwrap();
+                for (const jbc::ir::InsnId id : cu->dom.order()) {
+                    const jbc::ir::Insn* in = cu->dom.peek(id);
+                    if (in == nullptr || !bridge::isLdcFamily(in->op)) continue;
+                    jbc::ir::ClassSession::ConstSem cst;
+                    if (reopened->constOf(*in, cst)
+                        && cst.kind == jbc::ir::ClassSession::ConstSem::Kind::String
+                        && cst.str == std::string_view(e.plain)) {
+                        plainInPlace = true;
+                    }
+                }
+            }
+        }
+        expect(plainInPlace, std::string("结构：") + e.method + " 明文 ldc 在位");
+    }
+
+    // ── 8. 查验 B：真 JVM 对拍（原始编译产物 vs deobfed jar）──
+    const fs::path origOut = deobfDir / "orig.stdout";
+    const fs::path origErr = deobfDir / "orig.stderr";
+    const fs::path deobfOut = deobfDir / "deobfed.stdout";
+    const fs::path deobfErr = deobfDir / "deobfed.stderr";
+    const bool ranOrig = runJavaCapture(tools.javaExe, outDir.string(), origOut, origErr);
+    const bool ranDeobf = runJavaCapture(tools.javaExe, deobfJar.string(), deobfOut, deobfErr);
+    expect(ranOrig && ranDeobf, "对拍：两次 java 运行退出码均为 0");
+
+    bool capOk = false;
+    const std::vector<u8> origOutBytes = readFileBytes(origOut, capOk);
+    const std::vector<u8> deobfOutBytes = readFileBytes(deobfOut, capOk);
+    expect(origOutBytes == deobfOutBytes,
+           "对拍：原始版与 deobfed 版 stdout 逐字节一致（"
+               + std::to_string(origOutBytes.size()) + "B / "
+               + std::to_string(deobfOutBytes.size()) + "B）");
+    if (origOutBytes != deobfOutBytes && !origOutBytes.empty() && !deobfOutBytes.empty()) {
+        const usize n = origOutBytes.size() < deobfOutBytes.size() ? origOutBytes.size()
+                                                                  : deobfOutBytes.size();
+        for (usize i = 0; i < n; ++i) {
+            if (origOutBytes[i] != deobfOutBytes[i]) {
+                std::printf("    首个差异字节 @%zu：%02x vs %02x\n", i, origOutBytes[i],
+                            deobfOutBytes[i]);
+                break;
+            }
+        }
+    }
+    const std::string want = expectedJvmOutput();
+    expect(std::string(origOutBytes.begin(), origOutBytes.end()) == want,
+           "对拍：stdout == 期望明文（逐字节）");
+
+    // ── 9. 汇总 ──
     std::printf("断言 %d/%d 通过\n", gChecks - gFailures, gChecks);
     if (gFailures != 0) {
         std::printf("deobf 报告：存在失败断言\n");
         return 1;
     }
-    std::printf("deobf 报告：全部调用点密文还原成功\n");
+    std::printf("deobf 报告：全部调用点密文还原成功，导出 jar 双查验通过\n");
     return 0;
 }
