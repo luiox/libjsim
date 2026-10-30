@@ -133,8 +133,8 @@ inline void install(Session& session) {
         return Result<SimValue, Bail>::ok(SimValue::knownI32(codeUnit));
     };
 
-    session.callMocks["java/lang/String.length()I"] =
-        [](Frame& frame) -> Result<SimValue, Bail> {
+        session.callMocks["java/lang/String.length()I"] =
+            [](Frame& frame) -> Result<SimValue, Bail> {
         Result<SimValue, Bail> recv = frame.popChecked();
         if (!recv.isOk()) return Result<SimValue, Bail>::err(recv.error());
         if (!recv.value().known || recv.value().ref.kind != RefPayload::Kind::Str) {
@@ -142,6 +142,41 @@ inline void install(Session& session) {
         }
         return Result<SimValue, Bail>::ok(
             SimValue::knownI32(static_cast<i32>(codeUnitCount(recv.value().ref.str))));
+    };
+}
+
+/// 字符串构造两阶段（§7 jsim-str 职责面）：
+///   1. new java/lang/String 走分配脚手架（空 data 载荷，形态未初始化）；
+///   2. <init>([C)V 把 char[] 码元逐个 appendCodeUnit 写进接收者 data——
+///      构造完成前的对象只是脚手架壳，语义在第二阶段落位。
+/// <init> 的 CallRef.hasReturn=false（引擎不压返回值），初始化完的接收者
+/// 留在栈顶。形态不符（非 (String, char[]) 或载荷缺失）明确 Bail，不编造。
+inline void installStringAlloc(Session& session) {
+    session.allocScaffolds["java/lang/String"] = [] { return std::string(); };
+
+    session.callMocks["java/lang/String.<init>([C)V"] =
+        [](Frame& frame) -> Result<SimValue, Bail> {
+        Result<SimValue, Bail> arg = frame.popChecked(); // char[] 引用
+        if (!arg.isOk()) return Result<SimValue, Bail>::err(arg.error());
+        Result<SimValue, Bail> recv = frame.popChecked(); // new 出的 String 对象
+        if (!recv.isOk()) return Result<SimValue, Bail>::err(recv.error());
+        if (!arg.value().known || !recv.value().known ||
+            arg.value().ref.kind != RefPayload::Kind::Obj ||
+            recv.value().ref.kind != RefPayload::Kind::Obj) {
+            return Result<SimValue, Bail>::err(
+                {Bail::Reason::BadOperand, frame.pc(), "String.<init>：栈形态非 (String, char[])"});
+        }
+        auto& heap = frame.session().heap;
+        auto argIt = heap.find(arg.value().ref.objId);
+        auto recvIt = heap.find(recv.value().ref.objId);
+        if (argIt == heap.end() || recvIt == heap.end() || argIt->second.className != "[C") {
+            return Result<SimValue, Bail>::err(
+                {Bail::Reason::BadOperand, frame.pc(), "String.<init>：char[] 载荷缺失"});
+        }
+        std::string data;
+        for (i64 unit : argIt->second.elems) appendCodeUnit(data, static_cast<i32>(unit));
+        recvIt->second.data = std::move(data);
+        return Result<SimValue, Bail>::ok(SimValue::knownObj(recv.value().ref.objId));
     };
 }
 
