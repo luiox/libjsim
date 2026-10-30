@@ -1,6 +1,6 @@
 # libjsim 设计稿
 
-状态：设计草案 v0.3（2026-10-29）。v0.1 的三处结构性修正：默认 handler 只算类型不估值、核心只跑一个方法、语义注入全部下放扩展包。v0.3 落地扩展面缺口（字段接管、分支接管收帧、结构化观测与断点、栈平衡开关）并收紧三处口径（Str 身份位、multianewarray 全维分配、num 解析越界），见 §12。
+状态：设计草案 v0.4（2026-10-31）。v0.1 的三处结构性修正：默认 handler 只算类型不估值、核心只跑一个方法、语义注入全部下放扩展包。v0.3 落地扩展面缺口（字段接管、分支接管收帧、结构化观测与断点、栈平衡开关）并收紧三处口径（Str 身份位、multianewarray 全维分配、num 解析越界），见 §12。v0.4 把「桥由消费方自备」升格为官方扩展包 jsim-jbc（libjbc 模型 ↔ jsim 执行，见 §7/§9 与 docs/ext-jbc.md）。
 
 ## 1. 定位
 
@@ -116,11 +116,14 @@ handler 与接管的签名统一收完整进入帧：栈、局部变量、pc、�
 | jsim-random | java/util/Random 的 48 位 LCG 复刻 |
 | jsim-stacktrace | getStackTrace 假栈帧构造 |
 | jsim-indy | invokedynamic 的 bootstrap 脚手架，供用户组合特定调用点形态 |
+| jsim-jbc | libjbc 字节码模型 ↔ jsim 模拟执行的官方桥：CodeUnit → jsim::Method 形状搬运、LDC 字符串面（setString 自动升格口径）、消费方最小接管点。唯一带外部依赖（libjbc）的扩展包，详见 docs/ext-jbc.md |
 | jsim-jni | 本地方法接管的接缝与常用 mock 骨架 |
 
-包内每条接管带独立测试。包之间不互相依赖，组合发生在用户侧。框架不内置任何混淆器知识；jsim-stacktrace 虽然因解密场景而设，但内容是 Thread.getStackTrace 的 JDK 语义，归入 JDK 面扩展包。
+包内每条接管带独立测试。包之间不互相依赖，组合发生在用户侧（jsim-jbc 只依赖外部包 libjbc，不依赖其他扩展包）。框架不内置任何混淆器知识；jsim-stacktrace 虽然因解密场景而设，但内容是 Thread.getStackTrace 的 JDK 语义，归入 JDK 面扩展包。
 
 `jsim-reflect` 的边界值得单说：它**不解析 class 文件**。`ClassMeta`（类名 + 注解 + 元素值）由 provider 灌进来，libjbc 桥、JSON 表、手写脚本都从同一个口进。这样反射面既不依赖容器格式，也不把「怎么读注解」写死成一种实现。
+
+`jsim-jbc` 的边界同样单说：它是**模型搬运桥，不是语义包**。toSimMethod 只做形状搬运（指令摊 pc、标签折 pc、CP 索引重映射），不注册任何接管；桥出的 Method 配普通 Session 跑，缺的语义照 §6 接管面补（callMocks / allocScaffolds / opcodeHandlers / fieldMocks / branchHooks 对消费方全开放）。v0.3 起「桥由消费方自备」（原 §9）升格为官方扩展包位面，demo/deobf 即其消费方。
 
 ## 8. profile 层
 
@@ -134,15 +137,17 @@ dasho profile 的骨架：调用点形态多样，不做形态匹配，直接对
 
 (1) 真机对拍：算术与槽位重排恒等式以 HotSpot 实测结果为基准，不凭推导。对拍脚手架进共享测试层。
 
-(2) 语料：复用 mjt 仓已 vendor 的字节码语料；扩展包每条接管一测。
+(2) 语料：复用 mjt 仓已 vendor 的字节码语料；扩展包每条接管一测。jsim-jbc 用仓内合成语料（test/corpus，javac --release 8 产物 v52，运行期零 JDK 依赖），期望值由测试用同算法独立复算。
 
 (3) 判稳件：多 seed 一致性与明文合法性校验做成库内断言件，profile 直接调用。
 
-(4) 构建：delete-then-rebuild 门，测试产物进项目 test 目录。xmake 按包独立 target（jsim / jsim-str / jsim-num / jsim-reflect / jsim-indy / jsim-demo / jsim-test），扩展包互不依赖。
+(4) 构建：delete-then-rebuild 门，测试产物进项目 test 目录。xmake 按包独立 target（jsim / jsim-str / jsim-num / jsim-reflect / jsim-indy / jsim-jbc / jsim-demo / jsim-demo-deobf / jsim-test / jsim-jbc-test），扩展包互不依赖；jsim-jbc-test 与零依赖的 jsim-test 分立，libjbc 依赖只挂前者。
 
-核心零外部依赖（纯 std 头文件）。jbc 会话面（CodeUnit → jsim::Method）与
-MUTF-8 字符串面属边界胶水，由消费方仓自备（桥不在本仓）；libjstr 仅扩展包
-（ext/jsim）可选消费。
+核心零外部依赖（纯 std 头文件），零依赖红线只约束 src/jsim 核心——核心不进
+任何包依赖、对扩展包零反向依赖。jbc 会话面（CodeUnit → jsim::Method）自
+v0.3 起为官方扩展包 jsim-jbc（ext/jsim/jbc.hpp，依赖 libjbc）；MUTF-8 字符
+串面按家族口径在桥内原样透传（BMP 非零码元下与 UTF-8 逐字节相同，jsim-str
+按 UTF-8 码元读）；libjstr 仅扩展包（ext/jsim）可选消费。
 
 ## 10. 仓库骨架
 
@@ -150,11 +155,15 @@ MUTF-8 字符串面属边界胶水，由消费方仓自备（桥不在本仓）�
 libjsim/
   xmake.lua
   docs/design.md
-  src/jsim/        // 核心：value、session（堆+allocId+限制）、frame、
-                   //       handler（含栈效应表）、接管面、engine、bail、trace
-  ext/jsim/        // 扩展包：str、num、reflect、math、random、stacktrace、indy、jni
-  demo/            // 逐场景可执行样例（类型传播 / 接管面 / 区间 / 解密 / 反射）
-  test/            // 值代数、逐 handler、恒等式对拍、扩展包接管测试
+  docs/ext-jbc.md    // jsim-jbc 桥扩展包：依赖声明、API 面、最小接管点
+  src/jsim/          // 核心：value、session（堆+allocId+限制）、frame、
+                     //       handler（含栈效应表）、接管面、engine、bail、trace
+  ext/jsim/          // 扩展包：str、num、reflect、math、random、stacktrace、
+                     //           indy、jni、jbc（libjbc 桥）
+  demo/              // 逐场景可执行样例（类型传播 / 接管面 / 区间 / 解密 / 反射）
+  demo/deobf/        // 静态 deobf 样例：jsim-jbc 桥 + 模型层改写 + 双查验
+  test/              // 值代数、逐 handler、恒等式对拍、扩展包接管测试
+  test/corpus/       // jsim-jbc 合成语料（.java 源 + javac --release 8 产物）
 ```
 
 命名空间 jsim。仓规沿用生态约定：`///` 行注释、禁 RTTI、i32/u32/usize、Result 值语义、Utf8String、约定式提交带作用域。

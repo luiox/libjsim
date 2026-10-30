@@ -6,9 +6,9 @@
 /// 管线：
 ///   JsimObfSample.java --javac --release 8--> JsimObfSample.class（临时目录，不入库）
 ///     --libjbc makeSessionFromBytes--> ClassSession（backing DOM + 指令级 IR）
-///     --消费方桥--> jsim::Method（CodeUnit → Method 形状搬运）
+///     --jsim-jbc 桥--> jsim::Method（ext/jsim/jbc.hpp：CodeUnit → Method 形状搬运）
 ///     --Sim--> 每站点灌密文跑解密器 --> 明文 --> 断言
-///     --libjbc 改写--> setString(ldc, 明文) + erase(invokestatic) + lowerMethod
+///     --libjbc 改写--> setLdcString(ldc, 明文) + erase(invokestatic) + lowerMethod
 ///       （CP 追加与偏移/StackMapTable 重算由 libjbc 负责）+ removeMethod(解密器)
 ///       + writeClass --> class bytes --> JDK jar 工具打包 jsimobf-deobfed.jar
 ///     --查验 A--> libjzip 读回 jar 条目，libjbc 重开：解密器摘除/调用点清零/
@@ -17,14 +17,14 @@
 ///       且等于期望明文（改写后的 jar 真能跑、输出不变）。
 ///
 /// classfile 的解析与改写全部经 libjbc（luiox-repo 包）：demo 不自备字节码
-/// 解析器/序列化器。CodeUnit → jsim::Method 的桥是本文件自备的消费方桥
-/// （设计稿 §9「桥由消费方自备」），只做形状搬运：指令摊 pc 索引、标签折 pc、
-/// ldc 族 CP 索引重映射成紧凑表下标；字符串按家族口径 MUTF-8 字节原样透传
-/// 给 jsim 载荷（BMP 非零码元下 MUTF-8 与 UTF-8 逐字节相同，jsim-str 按
-/// UTF-8 码元读）。核心/扩展不认的语义按接管面注册：jsim-str 出
-/// String.length/charAt；new java/lang/String 的分配脚手架与 String.<init>([C)V
-/// 的「构造两阶段」语义由本 demo 注册（demo/main.cpp 场景 8/9 同款用法），
-/// 不改库核心语义。
+/// 解析器/序列化器。CodeUnit → jsim::Method 走 jsim-jbc 官方桥扩展包
+/// （ext/jsim/jbc.hpp）：指令摊 pc 索引、标签折 pc、ldc 族 CP 索引重映射成
+/// 紧凑表下标；字符串按家族口径 MUTF-8 字节原样透传给 jsim 载荷（BMP 非
+/// 零码元下 MUTF-8 与 UTF-8 逐字节相同，jsim-str 按 UTF-8 码元读）。
+/// 核心/扩展不认的语义按接管面注册：jsim-str 出 String.length/charAt 与
+/// new java/lang/String 的分配脚手架 + String.<init>([C)V 的「构造两阶段」
+/// （str::installStringAlloc）。demo 自留的只有 profile 面：调用点形态扫描、
+/// 解密器编排与判稳，不改库核心语义。
 
 /// std::getenv / std::fopen 在 MSVC CRT 标记为 deprecated；demo 有意用可移植面。
 #if defined(_MSC_VER)
@@ -59,6 +59,7 @@
 #include "jzip/zip_reader.hpp"
 
 #include "jsim/engine.hpp"
+#include "jsim/jbc.hpp"
 #include "jsim/str.hpp"
 
 using namespace jsim;
@@ -219,327 +220,22 @@ fs::path locateSampleSource(const char* argv0) {
     return {};
 }
 
-// ─────────── 消费方桥（libjbc CodeUnit → jsim::Method，设计稿 §9） ───────────
+// ─────────── 桥接（jsim-jbc 扩展包，ext/jsim/jbc.hpp） ───────────
 //
-// 只做形状搬运，不做语义解释：指令序列摊成 pc 索引、标签解析成 pc、ldc 族
-// CP 索引重映射成 jsim 侧紧凑表下标。任何一步拿不到确定信息就返回 false 并
-// 给出原因——宁可整方法放弃，也不产出「看起来能跑」的半截方法。
-namespace bridge {
-
-bool valTypeOfDescChar(char c, ValType& out) {
-    switch (c) {
-    case 'I': case 'Z': case 'B': case 'C': case 'S': out = ValType::I32; return true;
-    case 'J': out = ValType::I64; return true;
-    case 'F': out = ValType::F32; return true;
-    case 'D': out = ValType::F64; return true;
-    case 'L': case '[': out = ValType::Ref; return true;
-    default: return false;
-    }
-}
-
-/// 方法描述符返回段；`V` 置 hasReturn=false。
-bool retTypeOfDesc(std::string_view desc, ValType& out, bool& hasReturn) {
-    hasReturn = true;
-    const usize close = desc.find(')');
-    if (close == std::string_view::npos || close + 1 >= desc.size()) return false;
-    if (desc[close + 1] == 'V') {
-        hasReturn = false;
-        return true;
-    }
-    return valTypeOfDescChar(desc[close + 1], out);
-}
-
-bool fieldTypeOfDesc(std::string_view desc, ValType& out) {
-    return !desc.empty() && valTypeOfDescChar(desc.front(), out);
-}
-
-/// CP Class 条目 → 内部名（Class→Utf8 一跳）。
-std::string classNameOf(const jbc::core::ConstantPool& cp, ca::u32 classCp) {
-    if (!cp.valid(classCp)) return {};
-    const jbc::core::ConstantPool::Entry& e = cp.at(classCp);
-    if (e.tag != jbc::core::CpTag::Class) return {};
-    return std::string(cp.utf8Of(e.a));
-}
-
-/// CP 成员引用（Fieldref/Methodref/InterfaceMethodref）→ owner/name/desc。
-bool memberRefOf(const jbc::core::ConstantPool& cp, ca::u32 refCp, std::string& owner,
-                 std::string& name, std::string& desc) {
-    if (!cp.valid(refCp)) return false;
-    const jbc::core::ConstantPool::Entry& e = cp.at(refCp);
-    if (!cp.valid(e.b)) return false;
-    const jbc::core::ConstantPool::Entry& nat = cp.at(e.b);
-    if (nat.tag != jbc::core::CpTag::NameAndType) return false;
-    owner = classNameOf(cp, e.a);
-    name = std::string(cp.utf8Of(nat.a));
-    desc = std::string(cp.utf8Of(nat.b));
-    return !owner.empty() && !name.empty();
-}
-
-/// ldc 的 CP 条目搬进 jsim 紧凑表。String 走家族口径：MUTF-8 字节原样透传
-/// （BMP 非零码元与 UTF-8 逐字节相同，jsim-str 按 UTF-8 码元读）。
-bool appendCpEntry(const jbc::core::ConstantPool& cp, ca::u32 cpIndex, CpEntry& out) {
-    if (!cp.valid(cpIndex)) return false;
-    const jbc::core::ConstantPool::Entry& e = cp.at(cpIndex);
-    switch (e.tag) {
-    case jbc::core::CpTag::Integer:
-        out.kind = CpEntry::Kind::Int;
-        out.intValue = e.ival;
-        return true;
-    case jbc::core::CpTag::Float:
-        out.kind = CpEntry::Kind::Float;
-        out.intValue = e.ival; // 位型原样
-        return true;
-    case jbc::core::CpTag::Long:
-        out.kind = CpEntry::Kind::Long;
-        out.longValue = e.lval;
-        return true;
-    case jbc::core::CpTag::Double:
-        out.kind = CpEntry::Kind::Double;
-        out.longValue = e.lval; // 位型原样
-        return true;
-    case jbc::core::CpTag::String:
-        if (!cp.valid(e.a)) return false;
-        out.kind = CpEntry::Kind::Str;
-        out.strValue = std::string(cp.utf8Of(e.a));
-        return true;
-    case jbc::core::CpTag::Class:
-        out.kind = CpEntry::Kind::Class;
-        out.className = classNameOf(cp, cpIndex);
-        return !out.className.empty();
-    default:
-        return false;
-    }
-}
-
-bool isLdcFamily(jbc::core::Op op) {
-    return op == jbc::core::Op::LDC || op == jbc::core::Op::LDC_W
-           || op == jbc::core::Op::LDC2_W;
-}
-
-/// 指令句柄 → order() 下标的稳定散列键（owner 在单 DOM 内恒定）。
-ca::u64 insnKey(jbc::ir::InsnId id) {
-    return (static_cast<ca::u64>(id.slot) << 32) | static_cast<ca::u64>(id.gen);
-}
-
-ca::u64 labelKey(jbc::ir::LabelId id) {
-    return (static_cast<ca::u64>(id.slot) << 32) | static_cast<ca::u64>(id.gen);
-}
-
-/// 单方法转换（形状搬运）。失败时 why 带原因。
-bool toSimMethod(jbc::ir::ClassSession& s, ca::usize methodIdx, Method& out, std::string& why) {
-    const auto fail = [&why](const char* reason) {
-        why = reason;
-        return false;
-    };
-
-    if (!jbc::ir::hasCode(s, methodIdx)) return fail("方法无 Code 属性");
-    auto promoted = jbc::ir::promoteMethod(s, methodIdx);
-    if (promoted.is_err()) return fail("promoteMethod 失败");
-    jbc::ir::CodeUnitRef cu = promoted.unwrap();
-    if (!cu) return fail("promote 产物为空");
-
-    const jbc::ir::ClassUnit& unit = s.unit();
-    if (methodIdx >= unit.methods.size()) return fail("方法下标越界");
-    const jbc::ir::MethodUnit& mu = unit.methods[methodIdx];
-    const std::vector<jbc::ir::InsnId>& order = cu->dom.order();
-
-    // 指令句柄 → pc 下标。
-    std::unordered_map<ca::u64, ca::usize> insnPc;
-    insnPc.reserve(order.size() * 2);
-    for (ca::usize i = 0; i < order.size(); ++i) insnPc[insnKey(order[i])] = i;
-
-    // 标签 → pc：resolveLabel 折成下标；锚在方法末尾的标签折成 code.size()。
-    std::unordered_map<ca::u64, ca::usize> labelPc;
-    const auto resolveLabelPc = [&](jbc::ir::LabelId label, ca::usize& pc) -> bool {
-        const ca::u64 key = labelKey(label);
-        auto cached = labelPc.find(key);
-        if (cached != labelPc.end()) {
-            pc = cached->second;
-            return true;
-        }
-        auto resolved = cu->dom.resolveLabel(label);
-        if (resolved.is_err()) return false;
-        const jbc::ir::LabelTarget target = resolved.unwrap();
-        if (target.isEnd()) {
-            pc = order.size();
-        } else {
-            auto at = insnPc.find(insnKey(target.insn));
-            if (at == insnPc.end()) return false;
-            pc = at->second;
-        }
-        labelPc.emplace(key, pc);
-        return true;
-    };
-
-    const jbc::core::ConstantPool& cp = s.backing().cp;
-    out = Method{};
-    out.name = std::string(unit.symbols().str(mu.name));
-    out.desc = std::string(unit.symbols().str(mu.desc));
-    out.maxLocals = cu->maxLocals;
-    out.code.reserve(order.size());
-
-    // ldc 族的 backing CP 索引 → jsim 紧凑表下标。
-    std::unordered_map<ca::u32, ca::i32> cpToLocal;
-
-    for (ca::usize i = 0; i < order.size(); ++i) {
-        const jbc::ir::Insn* in = cu->dom.peek(order[i]);
-        if (in == nullptr) return fail("指令句柄悬垂");
-
-        Insn ji;
-        ji.opcode = static_cast<u8>(in->op);
-
-        if (isLdcFamily(in->op)) {
-            auto mapped = cpToLocal.find(in->cp);
-            if (mapped == cpToLocal.end()) {
-                CpEntry entry;
-                if (!appendCpEntry(cp, in->cp, entry)) return fail("ldc 常量种类未桥接");
-                const auto local = static_cast<ca::i32>(out.cp.size());
-                out.cp.push_back(std::move(entry));
-                mapped = cpToLocal.emplace(in->cp, local).first;
-            }
-            ji.a = mapped->second;
-            out.code.push_back(ji);
-            continue;
-        }
-
-        switch (in->op) {
-        case jbc::core::Op::INVOKEVIRTUAL:
-        case jbc::core::Op::INVOKESPECIAL:
-        case jbc::core::Op::INVOKESTATIC:
-        case jbc::core::Op::INVOKEINTERFACE: {
-            CallRef call;
-            if (!memberRefOf(cp, in->cp, call.owner, call.name, call.desc)) {
-                return fail("调用点引用解析失败");
-            }
-            bool hasRet = true;
-            if (!retTypeOfDesc(call.desc, call.retType, hasRet)) {
-                return fail("调用点描述符不可解析");
-            }
-            call.hasReturn = hasRet;
-            call.isStatic = in->op == jbc::core::Op::INVOKESTATIC;
-            ji.a = static_cast<i32>(out.calls.size());
-            out.calls.push_back(std::move(call));
-            break;
-        }
-        case jbc::core::Op::GETSTATIC:
-        case jbc::core::Op::PUTSTATIC:
-        case jbc::core::Op::GETFIELD:
-        case jbc::core::Op::PUTFIELD: {
-            FieldRef field;
-            if (!memberRefOf(cp, in->cp, field.owner, field.name, field.desc)) {
-                return fail("字段引用解析失败");
-            }
-            if (!fieldTypeOfDesc(field.desc, field.type)) return fail("字段类型不支持");
-            ji.a = static_cast<i32>(out.fields.size());
-            out.fields.push_back(std::move(field));
-            break;
-        }
-        case jbc::core::Op::NEW:
-        case jbc::core::Op::ANEWARRAY: {
-            std::string cls = classNameOf(cp, in->cp);
-            if (cls.empty()) return fail("类常量解析失败");
-            ji.a = static_cast<i32>(out.allocTypes.size());
-            out.allocTypes.push_back(std::move(cls));
-            break;
-        }
-        case jbc::core::Op::MULTIANEWARRAY: {
-            // libjbc：cp = 类常量（含全部 '['），a = 维数；jsim 侧要元素类型
-            //（剥掉 dims 个 '['）+ b = 维数。
-            std::string cls = classNameOf(cp, in->cp);
-            const auto dims = static_cast<usize>(in->a);
-            bool leadingBrackets = cls.size() >= dims;
-            for (usize k = 0; k < dims; ++k) leadingBrackets = leadingBrackets && cls[k] == '[';
-            if (cls.empty() || !leadingBrackets) return fail("multianewarray 类名与维数不符");
-            ji.a = static_cast<i32>(out.allocTypes.size());
-            out.allocTypes.push_back(cls.substr(dims));
-            ji.b = in->a;
-            break;
-        }
-        case jbc::core::Op::CHECKCAST:
-        case jbc::core::Op::INSTANCEOF:
-            // jsim 默认语义：checkcast 恒等 / instanceof 压 Unknown，操作数无需落位。
-            break;
-        case jbc::core::Op::NEWARRAY:
-            // libjbc 把 atype 放在 a；jsim 的 newarray 读 b（MethodBuilder 同口径）。
-            ji.a = 0;
-            ji.b = in->a;
-            break;
-        case jbc::core::Op::GOTO:
-        case jbc::core::Op::IFEQ:
-        case jbc::core::Op::IFNE:
-        case jbc::core::Op::IFLT:
-        case jbc::core::Op::IFGE:
-        case jbc::core::Op::IFGT:
-        case jbc::core::Op::IFLE:
-        case jbc::core::Op::IF_ICMPEQ:
-        case jbc::core::Op::IF_ICMPNE:
-        case jbc::core::Op::IF_ICMPLT:
-        case jbc::core::Op::IF_ICMPGE:
-        case jbc::core::Op::IF_ICMPGT:
-        case jbc::core::Op::IF_ICMPLE:
-        case jbc::core::Op::IF_ACMPEQ:
-        case jbc::core::Op::IF_ACMPNE:
-        case jbc::core::Op::IFNULL:
-        case jbc::core::Op::IFNONNULL: {
-            ca::usize target = 0;
-            if (!resolveLabelPc(in->target, target)) return fail("分支目标解析失败");
-            ji.a = static_cast<i32>(target);
-            break;
-        }
-        default:
-            if (in->op == jbc::core::Op::INVOKEDYNAMIC || in->op == jbc::core::Op::TABLESWITCH
-                || in->op == jbc::core::Op::LOOKUPSWITCH || in->op == jbc::core::Op::JSR
-                || in->op == jbc::core::Op::JSR_W || in->op == jbc::core::Op::RET
-                || in->op == jbc::core::Op::ATHROW) {
-                return fail("指令族未桥接（合成样本未出现）");
-            }
-            // 常量/装载存储/算术/转换/栈操作/iinc：a/b 原样搬运。
-            ji.a = in->a;
-            ji.b = in->b;
-            break;
-        }
-
-        out.code.push_back(ji);
-    }
-    return true;
-}
-
-} // namespace bridge
+// CodeUnit → jsim::Method 的形状搬运升格为官方扩展包：toSimMethod（指令摊
+// pc 索引、标签折 pc、ldc 族 CP 索引重映射成 jsim 紧凑表下标）、isLdcFamily、
+// setLdcString（setString 语义改写，LDC→LDC_W 自动升格由 libjbc 负责）。
+// demo 只保留自己的 profile 面：调用点形态扫描、解密器编排与判稳。
 
 // ───────────────────────── 解密器模拟还原 ─────────────────────────
 
-/// 每站点一个干净 Session：jsim-str 出 String.length/charAt；String 构造
-/// 两阶段语义 demo 自备——new 出脚手架对象，<init>([C)V 把 char[] 码元逐个
-/// appendCodeUnit 写进对象 data；areturn 返回该对象，报告从堆里读 data。
+/// 每站点一个干净 Session：jsim-str 出 String.length/charAt 与字符串构造
+/// 两阶段（new 出脚手架对象，<init>([C)V 把 char[] 码元逐个 appendCodeUnit
+/// 写进对象 data）；areturn 返回该对象，报告从堆里读 data。
 Session makeSession() {
     Session session;
     str::install(session);
-    session.allocScaffolds["java/lang/String"] = [] { return std::string(); };
-    session.callMocks["java/lang/String.<init>([C)V"] =
-        [](Frame& frame) -> Result<SimValue, Bail> {
-        Result<SimValue, Bail> arg = frame.popChecked(); // char[] 引用
-        if (!arg.isOk()) return Result<SimValue, Bail>::err(arg.error());
-        Result<SimValue, Bail> recv = frame.popChecked(); // new 出的 String 对象
-        if (!recv.isOk()) return Result<SimValue, Bail>::err(recv.error());
-        if (!arg.value().known || !recv.value().known ||
-            arg.value().ref.kind != RefPayload::Kind::Obj ||
-            recv.value().ref.kind != RefPayload::Kind::Obj) {
-            return Result<SimValue, Bail>::err(
-                {Bail::Reason::BadOperand, frame.pc(), "String.<init>：栈形态非 (String, char[])"});
-        }
-        auto& heap = frame.session().heap;
-        auto argIt = heap.find(arg.value().ref.objId);
-        auto recvIt = heap.find(recv.value().ref.objId);
-        if (argIt == heap.end() || recvIt == heap.end() || argIt->second.className != "[C") {
-            return Result<SimValue, Bail>::err(
-                {Bail::Reason::BadOperand, frame.pc(), "String.<init>：char[] 载荷缺失"});
-        }
-        std::string data;
-        for (i64 unit : argIt->second.elems) str::appendCodeUnit(data, static_cast<i32>(unit));
-        recvIt->second.data = std::move(data);
-        // hasReturn=false：<init> 无返回值，引擎不压栈；初始化完的接收者留在栈顶。
-        return Result<SimValue, Bail>::ok(SimValue::knownObj(recv.value().ref.objId));
-    };
+    str::installStringAlloc(session);
     return session;
 }
 
@@ -576,7 +272,7 @@ std::vector<CallSite> scanCallSites(jbc::ir::ClassSession& s, const std::string&
             const jbc::ir::Insn* ldcInsn = cu->dom.peek(order[i]);
             const jbc::ir::Insn* invInsn = cu->dom.peek(order[i + 1]);
             if (ldcInsn == nullptr || invInsn == nullptr) continue;
-            if (!bridge::isLdcFamily(ldcInsn->op) || invInsn->op != jbc::core::Op::INVOKESTATIC) {
+            if (!jbcbridge::isLdcFamily(ldcInsn->op) || invInsn->op != jbc::core::Op::INVOKESTATIC) {
                 continue;
             }
             jbc::ir::ClassSession::ConstSem cst;
@@ -783,13 +479,13 @@ int main(int argc, char** argv) {
     const jbc::ir::MethodId decryptId = session->unit().methods[decryptIdx].id;
     std::printf("解密器：%s%s%s\n", thisName.c_str(), kDecryptName.c_str(), kDecryptDesc.c_str());
 
-    // ── 3. 消费方桥：解密器 CodeUnit → jsim::Method，指令形态核对 ──
-    Method simMethod;
-    std::string bridgeWhy;
-    if (!bridge::toSimMethod(*session, decryptIdx, simMethod, bridgeWhy)) {
-        std::printf("桥接失败：%s\n", bridgeWhy.c_str());
+    // ── 3. 桥接（jsim-jbc）：解密器 CodeUnit → jsim::Method，指令形态核对 ──
+    auto bridged = jbcbridge::toSimMethod(*session, decryptIdx);
+    if (!bridged.isOk()) {
+        std::printf("桥接失败：%s\n", bridged.error().detail.c_str());
         return 1;
     }
+    Method simMethod = std::move(bridged.value());
     std::printf("桥接（CodeUnit → jsim::Method）：%zu 条指令，maxLocals=%u\n",
                 simMethod.code.size(), simMethod.maxLocals);
 
@@ -871,15 +567,10 @@ int main(int argc, char** argv) {
     for (usize k = 0; k < sites.size(); ++k) {
         CallSite& site = sites[k];
         const std::string& plain = recoveredPlain[k];
-        auto ldcGot = site.unit->dom.get(site.ldc);
-        if (ldcGot.is_err()) {
-            std::printf("  取 ldc 句柄失败：%s\n", jbc::ir::to_string(ldcGot.unwrap_err()));
-            rewriteOk = false;
-            break;
-        }
-        // setString：CP 追加明文 String（intern 去重），索引超 u1 域自动升格 ldc→ldc_w。
-        if (!session->setString(*ldcGot.unwrap(), plain)) {
-            std::printf("  setString 失败（站点 %s）\n", site.method.c_str());
+        // setLdcString（桥包）：CP 追加明文 String（intern 去重），索引超 u1 域
+        // 自动升格 ldc→ldc_w（宽度陷阱由 libjbc 挡掉）。
+        if (!jbcbridge::setLdcString(*session, site.unit->dom, site.ldc, plain)) {
+            std::printf("  setLdcString 失败（站点 %s）\n", site.method.c_str());
             rewriteOk = false;
             break;
         }
@@ -978,7 +669,7 @@ int main(int argc, char** argv) {
                 jbc::ir::CodeUnitRef cu = promoted.unwrap();
                 for (const jbc::ir::InsnId id : cu->dom.order()) {
                     const jbc::ir::Insn* in = cu->dom.peek(id);
-                    if (in == nullptr || !bridge::isLdcFamily(in->op)) continue;
+                    if (in == nullptr || !jbcbridge::isLdcFamily(in->op)) continue;
                     jbc::ir::ClassSession::ConstSem cst;
                     if (reopened->constOf(*in, cst)
                         && cst.kind == jbc::ir::ClassSession::ConstSem::Kind::String
