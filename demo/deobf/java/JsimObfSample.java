@@ -71,11 +71,31 @@ public final class JsimObfSample {
         System.out.println(decrypt("\u701e"));
     }
 
+    /// 生成器自带的加密例程：与 decrypt 同算法（XOR 对合，加密即解密）。独立成
+    /// 方法而不直接调 decrypt——deobf 导出件会摘掉解密器，生成入口只在原样件
+    /// 里复现密文，不依赖解密器存在。
+    private static String encryptForGen(String text) {
+        int last = text.length() - 1;
+        char[] out = new char[text.length()];
+        int keyOddFromEnd = (2 ^ 5) << 3 ^ (3 ^ 5); // 折 62：距尾奇数位
+        int decoy = 4 << 4 ^ (3 << 2 ^ 1);          // 死常量迷惑：折 77，从不使用
+        int keyEvenFromEnd = (2 ^ 5) << 4 ^ 1;      // 折 113：距尾偶数位（含末位）
+        while (last >= 0) {
+            out[last] = (char) (text.charAt(last) ^ keyEvenFromEnd);
+            if (--last < 0) {
+                break;
+            }
+            out[last] = (char) (text.charAt(last) ^ keyOddFromEnd);
+            last--;
+        }
+        return new String(out);
+    }
+
     /// --gen 打印 PLAINS 的密文十六进制转义字面量（复现调用点密文）；无参则真 JVM 自检。
     public static void main(String[] args) {
         if (args.length == 1 && "--gen".equals(args[0])) {
             for (String plain : PLAINS) {
-                String cipher = decrypt(plain); // XOR 对合：加密即解密
+                String cipher = encryptForGen(plain);
                 StringBuilder literal = new StringBuilder("\"");
                 for (int i = 0; i < cipher.length(); i++) {
                     literal.append(String.format("\\u%04x", (int) cipher.charAt(i)));
