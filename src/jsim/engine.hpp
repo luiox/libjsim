@@ -45,6 +45,29 @@ private:
     E error_{};
 };
 
+/// void 特化:无值成功面(写内存、释放这类只有成败的操作)。MVP Result 原版
+/// 无法承载 Result<void, E>——值成员与引用成员对 void 全部非法。
+template <class E>
+class Result<void, E> {
+public:
+    static Result ok() { return Result{}; }
+
+    static Result err(E e) {
+        Result r;
+        r.hasValue_ = false;
+        r.error_ = std::move(e);
+        return r;
+    }
+
+    bool isOk() const { return hasValue_; }
+    E& error() { return error_; }
+    const E& error() const { return error_; }
+
+private:
+    bool hasValue_ = true;
+    E error_{};
+};
+
 /// 结构化失败（设计 §1 失败面）。Bail 是一等公民：带原因码、pc 与现场说明，
 /// 调用方决定降级策略；框架不崩溃、不静默走错。步数超限走 RunResult::LimitHit，
 /// 不经 Bail。

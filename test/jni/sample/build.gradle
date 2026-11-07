@@ -1,0 +1,50 @@
+// E2E sample build (CI-friendly): Java trio compiled with --release 8 and a
+// self-contained native DLL (no CRT, no imports, no DllMain) bundled with the
+// classes into ../../corpus/jni/jni-sample.jar.
+//
+// The jar is a build product, NOT committed to the repository; the e2e test
+// (jsim-jni-e2e-test) skips with a notice when it is absent.
+//
+// The native task shells out to cl/link and therefore expects the MSVC
+// environment (run gradle from a VS developer prompt, or let build-sample.ps1
+// prepare one). Gradle itself only needs a JDK on PATH.
+//
+// Regenerate:  gradle sampleJar
+
+plugins { id 'java' }
+
+def corpusJar = file('../../corpus/jni/jni-sample.jar')
+
+compileJava {
+    // Pin class file to v52 (javac --release 8); JDK 8 falls back to its default.
+    options.release = 8
+    options.encoding = 'UTF-8'
+}
+
+tasks.register('nativeDll') {
+    description = 'Builds decrypt.dll (x64, /BASE:0x10000, no CRT, no imports).'
+    outputs.file('decrypt.dll')
+    doLast {
+        def out = new ByteArrayOutputStream()
+        exec {
+            commandLine 'cmd', '/c', 'cl /nologo /c /GS- /Zl /O2 /Fodecrypt.obj decrypt_jni.c && ' +
+                'link /nologo /DLL /NOENTRY /NODEFAULTLIB /MACHINE:X64 /BASE:0x10000 /OUT:decrypt.dll decrypt.obj'
+            standardOutput = out
+            errorOutput = out
+        }
+        println out.toString().trim()
+    }
+}
+
+tasks.register('sampleJar', Jar) {
+    description = 'Bundles classes + decrypt.dll into the corpus jar (build product).'
+    dependsOn compileJava, nativeDll
+    destinationDirectory = file(corpusJar.parent)
+    archiveFileName = corpusJar.name
+    from(sourceSets.main.output) { include 'sample/*.class' }
+    from(file('decrypt.dll'))
+}
+
+tasks.register('printCorpusJar') {
+    doLast { println corpusJar }
+}

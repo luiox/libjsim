@@ -10,6 +10,23 @@ add_requires("libjdk_finder 0.1.1")
 add_requires("libjbc 0.4.24")
 add_requires("libjzip 0.0.4")
 
+-- 网络受限的本机开发:--unicorn_dir=<dir> 指向预编译 unicorn(include/ +
+-- lib/unicorn.lib,如 python unicorn wheel 自带的那份,2.1.x),三个 unicorn
+-- 消费面改走本地链接;CI 不设该配置,照常 add_requires("unicorn 2.1.4")。
+option("unicorn_dir")
+    set_default("")
+    set_showmenu(true)
+    set_description("local prebuilt unicorn dir (include/ + lib/unicorn.lib)")
+option_end()
+
+local unicorn_dir = get_config("unicorn_dir")
+if unicorn_dir == nil then unicorn_dir = "" end
+
+-- 官方 xmake-repo 依赖只在走网络路径时装载;--unicorn_dir 旁路时完全不触网。
+if unicorn_dir == "" then
+    add_requires("unicorn 2.1.4")
+end
+
 -- 核心零外部依赖（设计 §9）；扩展包逐包独立 target，按需依赖（设计 §7）。
 target("jsim")
     set_kind("headeronly")
@@ -51,6 +68,31 @@ target("jsim-jbc")
     add_deps("jsim")
     add_packages("libjbc", { public = true })
 
+-- jsim-jni 本地方法扩展包(docs/ext-jni.md):纯层——JNI 函数表(JDK 8 布局)、
+-- 钩子分发、句柄池、编组、默认骨架、install 接缝。零外部依赖,测试走 FakeMachine。
+target("jsim-jni")
+    set_kind("headeronly")
+    add_headerfiles("ext/jsim/jni.hpp")
+    add_includedirs("ext", { public = true })
+    add_deps("jsim")
+
+-- jsim-jni 绑定层:unicorn 引擎持有、JNIEnv 表与 trap page 物化、x86-64 ABI
+-- (Win64 + SysV)寄存器编组、步数熔断。依赖例外已记录:绑定子面 → 语义面。
+target("jsim-jni-uc")
+    set_kind("headeronly")
+    add_headerfiles("ext/jsim/jni_uc.hpp")
+    add_includedirs("ext", { public = true })
+    add_deps("jsim", "jsim-jni")
+    if unicorn_dir ~= "" then
+        add_defines("UNICORN_SHARED", { public = true })
+        add_includedirs(path.join(unicorn_dir, "include"), { public = true })
+        add_linkdirs(path.join(unicorn_dir, "lib"), { public = true })
+        add_links("unicorn", { public = true })
+        add_runenvs("PATH", path.join(unicorn_dir, "lib"), path.join(unicorn_dir, "bin"))
+    else
+        add_packages("unicorn", { public = true })
+    end
+
 target("jsim-demo")
     set_kind("binary")
     add_files("demo/main.cpp")
@@ -87,6 +129,50 @@ target("jsim-jbc-test")
     set_kind("binary")
     add_files("test/jbc/main.cpp")
     add_deps("jsim", "jsim-str", "jsim-jbc")
+    if is_plat("windows") then
+        add_cxxflags("/utf-8")
+    end
+
+-- jsim-jni 纯层测试(FakeMachine 驱动,零 unicorn 依赖):骨架逐条、句柄池
+-- 生命周期、异常位、编组对拍、钩子覆盖优先级(docs/ext-jni.md 测试节)。
+target("jsim-jni-test")
+    set_kind("binary")
+    add_files("test/jni/main.cpp")
+    add_deps("jsim", "jsim-jni")
+    if is_plat("windows") then
+        add_cxxflags("/utf-8")
+    end
+
+-- jsim-jni 端到端 demo:手写 x64 Win64 机器码的 native 方法(GetStringUTFChars
+-- → XOR → NewStringUTF),jsim 字节码 invokestatic 发起走完整链;兼作绑定层
+-- 的真机验证。期望值 C++ 独立复算。
+target("jsim-demo-jni")
+    set_kind("binary")
+    add_files("demo/jni/main.cpp")
+    add_deps("jsim", "jsim-jni", "jsim-jni-uc")
+    if unicorn_dir == "" then
+        add_packages("unicorn")
+    else
+        add_runenvs("PATH", path.join(unicorn_dir, "lib"), path.join(unicorn_dir, "bin"))
+    end
+    if is_plat("windows") then
+        add_cxxflags("/utf-8")
+    end
+
+-- jsim-jni 端到端测试(真 jar + 真 DLL):libjzip 解包语料 jar → PE 装载(首选
+-- 基址 + 导出表定位入口)→ jsim-jbc 桥出调用方字节码 → jsim → unicorn 跑真
+-- 机器码 → JNI 骨架钩子 → 明文还原;JDK 可用时另跑真 JVM 对拍腿。样本再生成:
+-- test/jni/sample/build-sample.ps1 或 gradle sampleJar。
+target("jsim-jni-e2e-test")
+    set_kind("binary")
+    add_files("test/jni/e2e/main.cpp")
+    add_deps("jsim", "jsim-jni", "jsim-jni-uc", "jsim-jbc")
+    if unicorn_dir == "" then
+        add_packages("unicorn")
+    else
+        add_runenvs("PATH", path.join(unicorn_dir, "lib"), path.join(unicorn_dir, "bin"))
+    end
+    add_packages("libjbc", "libjzip", "libjdk_finder")
     if is_plat("windows") then
         add_cxxflags("/utf-8")
     end

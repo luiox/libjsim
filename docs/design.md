@@ -1,6 +1,6 @@
 # libjsim 设计稿
 
-状态：设计草案 v0.4（2026-10-31）。v0.1 的三处结构性修正：默认 handler 只算类型不估值、核心只跑一个方法、语义注入全部下放扩展包。v0.3 落地扩展面缺口（字段接管、分支接管收帧、结构化观测与断点、栈平衡开关）并收紧三处口径（Str 身份位、multianewarray 全维分配、num 解析越界），见 §12。v0.4 把「桥由消费方自备」升格为官方扩展包 jsim-jbc（libjbc 模型 ↔ jsim 执行，见 §7/§9 与 docs/ext-jbc.md）。
+状态：设计草案 v0.5（2026-11-07）。v0.1 的三处结构性修正：默认 handler 只算类型不估值、核心只跑一个方法、语义注入全部下放扩展包。v0.3 落地扩展面缺口（字段接管、分支接管收帧、结构化观测与断点、栈平衡开关）并收紧三处口径（Str 身份位、multianewarray 全维分配、num 解析越界），见 §12。v0.4 把「桥由消费方自备」升格为官方扩展包 jsim-jbc（libjbc 模型 ↔ jsim 执行，见 §7/§9 与 docs/ext-jbc.md）。v0.5 落地 jsim-jni 本地方法扩展包（j2c native 方法由 unicorn 执行、JNI 调用转接包内钩子，见 §7/§9 与 docs/ext-jni.md）。
 
 ## 1. 定位
 
@@ -117,7 +117,7 @@ handler 与接管的签名统一收完整进入帧：栈、局部变量、pc、�
 | jsim-stacktrace | getStackTrace 假栈帧构造 |
 | jsim-indy | invokedynamic 的 bootstrap 脚手架，供用户组合特定调用点形态 |
 | jsim-jbc | libjbc 字节码模型 ↔ jsim 模拟执行的官方桥：CodeUnit → jsim::Method 形状搬运、LDC 字符串面（setString 自动升格口径）、消费方最小接管点。唯一带外部依赖（libjbc）的扩展包，详见 docs/ext-jbc.md |
-| jsim-jni | 本地方法接管的接缝与常用 mock 骨架 |
+| jsim-jni | 本地方法接管的接缝与常用 mock 骨架：纯层（JNI 函数表、钩子分发、句柄池、编组、骨架、install 接缝，零依赖）+ jni-uc 绑定层（unicorn x86-64 Win64/SysV，env 表与 trap page 物化、ABI 编组、步数熔断）。native 由 unicorn 执行，JNI 调用转接钩子，用户钩子可整体替换任何 JNI 函数，见 docs/ext-jni.md |
 
 包内每条接管带独立测试。包之间不互相依赖，组合发生在用户侧（jsim-jbc 只依赖外部包 libjbc，不依赖其他扩展包）。框架不内置任何混淆器知识；jsim-stacktrace 虽然因解密场景而设，但内容是 Thread.getStackTrace 的 JDK 语义，归入 JDK 面扩展包。
 
@@ -141,7 +141,7 @@ dasho profile 的骨架：调用点形态多样，不做形态匹配，直接对
 
 (3) 判稳件：多 seed 一致性与明文合法性校验做成库内断言件，profile 直接调用。
 
-(4) 构建：delete-then-rebuild 门，测试产物进项目 test 目录。xmake 按包独立 target（jsim / jsim-str / jsim-num / jsim-reflect / jsim-indy / jsim-jbc / jsim-demo / jsim-demo-deobf / jsim-test / jsim-jbc-test），扩展包互不依赖；jsim-jbc-test 与零依赖的 jsim-test 分立，libjbc 依赖只挂前者。
+(4) 构建：delete-then-rebuild 门，测试产物进项目 test 目录。xmake 按包独立 target（jsim / jsim-str / jsim-num / jsim-reflect / jsim-indy / jsim-jbc / jsim-jni / jsim-jni-uc / jsim-demo / jsim-demo-deobf / jsim-demo-jni / jsim-test / jsim-jbc-test / jsim-jni-test / jsim-jni-e2e-test），扩展包互不依赖；jsim-jbc-test 与零依赖的 jsim-test 分立，libjbc 依赖只挂前者；jsim-jni-test 零 unicorn 依赖（FakeMachine 驱动纯层），unicorn 只挂 jsim-jni-uc 与 jsim-demo-jni；jsim-jni-e2e-test 挂 libjbc/libjzip/libjdk_finder（真机对拍腿用后者找本机 JDK）。jsim-jni-uc → jsim-jni 是绑定子面对语义面的位面分层，不是语义堆叠，记为「扩展包互不依赖」的唯一例外。unicorn 经官方 xmake-repo（2.1.4）；本机网络不通 release 包时可用 `--unicorn_dir=<本地预编译目录>` 旁路，CI 不受影响。
 
 核心零外部依赖（纯 std 头文件），零依赖红线只约束 src/jsim 核心——核心不进
 任何包依赖、对扩展包零反向依赖。jbc 会话面（CodeUnit → jsim::Method）自
@@ -159,11 +159,15 @@ libjsim/
   src/jsim/          // 核心：value、session（堆+allocId+限制）、frame、
                      //       handler（含栈效应表）、接管面、engine、bail、trace
   ext/jsim/          // 扩展包：str、num、reflect、math、random、stacktrace、
-                     //           indy、jni、jbc（libjbc 桥）
+                     //           indy、jni（纯层）+ jni_uc（unicorn 绑定）、
+                     //           jbc（libjbc 桥）
   demo/              // 逐场景可执行样例（类型传播 / 接管面 / 区间 / 解密 / 反射）
   demo/deobf/        // 静态 deobf 样例：jsim-jbc 桥 + 模型层改写 + 双查验
   test/              // 值代数、逐 handler、恒等式对拍、扩展包接管测试
+  test/jni/          // jsim-jni 测试：FakeMachine 纯层测试 + e2e + sample/
+                     //（Java 源 + 自包含 C 源 + build-sample.ps1 + build.gradle）
   test/corpus/       // jsim-jbc 合成语料（.java 源 + javac --release 8 产物）
+                     //   jni/（jsim-jni 语料 jar 生成到此处：构建产物不入库）
 ```
 
 命名空间 jsim。仓规沿用生态约定：`///` 行注释、禁 RTTI、i32/u32/usize、Result 值语义、Utf8String、约定式提交带作用域。
@@ -205,6 +209,26 @@ invokedynamic（Bail，语义由 jsim-indy 组合）、异常表派发（athrow 
 **(11) jsim-num 解析越界。** `Integer.parseInt("2147483648")` 首版静默回绕（注释自称「按 JVM 口径回绕」——那是算术口径，解析口径在 JDK 是 NumberFormatException）。现在越界与位数溢出一律解析失败 Bail，对齐本包「不编造 0」的契约。
 
 **(12) 工程面。** 测试层落地（test/，90 项断言：值代数、逐类 handler、五个完备面、扩展包每条接管一测）；xmake 按包独立 target（jsim-str/num/reflect/indy）；demo 移除未消费的 libjstr 依赖；MethodBuilder 补 if_acmpeq 族与 multianewarray 助手。
+
+### v0.5（2026-11-07）：jsim-jni 本地方法扩展包
+
+issue #4 的落地。执行链：模拟字节码 invoke 到 native 方法 → install 挂进 callMockResolvers 兜底链的解析器认领（键 = owner.name+desc，callMocks 优先级天然更高）→ 弹参编组成位型 → unicorn 跑机器码 → 机器码经物化的 JNIEnv 函数表（JDK 8 冻结布局 233 项）调表 → trap page 上的 UC_HOOK_CODE 按地址差还原函数号 → dispatch 查钩子（用户钩子 > 默认骨架 > Bail{UnsupportedCall}）→ 返回位型写回寄存器 → native 停机后解码回 SimValue。锚点与 javavm-master/SSVM 的教训相反：锚 JNI ABI（冻结的表布局与调用约定），不锚任何混淆器的代码形态。
+
+拍板记录：
+
+| # | 决定 |
+|---|---|
+| D13 | 分层双 target：jsim-jni 纯层零依赖（FakeMachine 可测）+ jsim-jni-uc 绑定层（unicorn）。绑定子面 → 语义面是「扩展包互不依赖」的唯一例外（§9 已记） |
+| D14 | 句柄是假 guest 指针，不映射页——机器码解引用句柄落未映射读，由绑定层转 Bail{BadOperand}；local 一次调用回收，global 跨调用持久 |
+| D15 | 字符串物化副本落 scratch 区，Release\* 回收；字节按家族口径 MUTF-8 原样透传 |
+| D16 | 字段读写直连 Session.statics / HeapObj.fields——native 侧与字节码侧同一份状态；缺值 Bail{NotConcrete}（native 无法表达 Unknown，不编 0） |
+| D17 | Call\*Method 经 env.javaInvoker 回跳，消费方开嵌套 Sim（D9 不破）；A 变体读 jvalue\*，V 变体 Win64 直读、SysV 拒，裸变体按 ABI 位置读 |
+| D18 | 异常面是 pendingThrow 位：ThrowNew 置位，ExceptionCheck/Occurred 反映，置位期间拒非检查类调用，native 收尾仍在则整体 Bail（athrow 同纪律） |
+| D19 | 包不做二进制加载：入口地址由消费方给（手工填表或 RegisterNatives 骨架录表）；ABI 先行 Win64 + SysV，AArch64 留位 |
+| D20 | JNIEnv 双重间接物化：env 是指向 JNIEnv 结构的指针，结构首成员才是函数表（`(*env)->Fn`）。物化两页 `[envTable] = funcTable`、`funcTable[i] = trapPage + i*8`。教训：demo 机器码与样本 DLL 曾按「env 即表」的单重间接两边一致地错，由真机对拍腿（HotSpot 跑同一份 DLL）抓出——JNI ABI 约定必须对真机验证，两套模拟互证不构成证据 |
+| D21 | JNI C 字符串口径：GetStringUTFChars 契约是 NUL 终止 C 串，实参字符串首个 NUL 之后不可往返，HotSpot 同口径；含 0x00 字节的样本按截断后比对，是 ABI 事实而非缺陷。测试样本构建（Java 源 + 自包含 C 源 + ps1/gradle）进仓 `test/jni/sample/`；产物 jar 生成到 `test/corpus/jni/` 但不入库，E2E 语料缺失时整条跳过并提示再生成命令 |
+
+E2E 证据（jsim-jni-e2e-test）：本地生成的 `test/corpus/jni/jni-sample.jar`（真实 MSVC 编译的 decrypt.dll）→ jar 条目读出 → PE64 按字节偏移解析、首选基址展开、导出表定位入口（消费方装载职责的参考实现）→ jsim-jbc 桥出字节码 → invokestatic → unicorn 跑真机器码 → 明文还原，且与 HotSpot 跑同 jar 同 DLL 的输出一致。样本再生成：`test/jni/sample/build-sample.ps1` 或 `gradle sampleJar`。
 
 ## 附录 A：存量证据
 
