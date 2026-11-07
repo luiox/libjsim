@@ -32,6 +32,9 @@ __declspec(dllexport) void *Java_sample_Decrypt_decrypt(void *env, void *clazz, 
     for (int i = 0; chars[i] != 0; ++i) {
         chars[i] = (char)(chars[i] ^ 0x5A);
     }
+    /* Copy out before release: the buffer is dead after ReleaseStringUTFChars
+     * (reading it afterwards is UB on a real JVM, even if it happens to work). */
+    void *result = newStringUTF(env, chars);
     releaseStringUTFChars(env, input, chars);
-    return newStringUTF(env, chars);
+    return result;
 }

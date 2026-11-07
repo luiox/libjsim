@@ -22,6 +22,11 @@ option_end()
 local unicorn_dir = get_config("unicorn_dir")
 if unicorn_dir == nil then unicorn_dir = "" end
 
+-- 官方 xmake-repo 依赖只在走网络路径时装载;--unicorn_dir 旁路时完全不触网。
+if unicorn_dir == "" then
+    add_requires("unicorn 2.1.4")
+end
+
 -- 核心零外部依赖（设计 §9）；扩展包逐包独立 target，按需依赖（设计 §7）。
 target("jsim")
     set_kind("headeronly")
@@ -83,7 +88,7 @@ target("jsim-jni-uc")
         add_includedirs(path.join(unicorn_dir, "include"), { public = true })
         add_linkdirs(path.join(unicorn_dir, "lib"), { public = true })
         add_links("unicorn", { public = true })
-        add_runenvs("PATH", path.join(unicorn_dir, "bin"))
+        add_runenvs("PATH", path.join(unicorn_dir, "lib"), path.join(unicorn_dir, "bin"))
     else
         add_packages("unicorn", { public = true })
     end
@@ -148,7 +153,7 @@ target("jsim-demo-jni")
     if unicorn_dir == "" then
         add_packages("unicorn")
     else
-        add_runenvs("PATH", path.join(unicorn_dir, "bin"))
+        add_runenvs("PATH", path.join(unicorn_dir, "lib"), path.join(unicorn_dir, "bin"))
     end
     if is_plat("windows") then
         add_cxxflags("/utf-8")
@@ -165,7 +170,7 @@ target("jsim-jni-e2e-test")
     if unicorn_dir == "" then
         add_packages("unicorn")
     else
-        add_runenvs("PATH", path.join(unicorn_dir, "bin"))
+        add_runenvs("PATH", path.join(unicorn_dir, "lib"), path.join(unicorn_dir, "bin"))
     end
     add_packages("libjbc", "libjzip", "libjdk_finder")
     if is_plat("windows") then

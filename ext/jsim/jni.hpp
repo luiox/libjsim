@@ -386,7 +386,10 @@ inline u32 indexOf(std::string_view name)
 /// 机器码解引用句柄会落到未映射读,由绑定层转 Bail{BadOperand}。
 struct HandlePool
 {
-    static constexpr u64 kBase = 0x00400000;
+    /// 句柄发号区起点。必须落在 scratch 物化区(Layout::scratch + scratchSize)
+    /// 之后:句柄区不映射,若与 scratch 重叠,解引用句柄会读到物化数据而不是
+    /// 落未映射读 Bail(D14 的失败模式就废了)。
+    static constexpr u64 kBase = 0x00410000;
     static constexpr u64 kStride = 8;
     static constexpr u64 kJavaVm = 0x00600000; ///< GetJavaVM 的假 VM 句柄
 
@@ -671,7 +674,8 @@ inline Result<std::string, Bail> classNameOfClass(JniEnv& env, u64 h)
 inline usize elemWidthOf(const std::string& arrayClass)
 {
     if (arrayClass == "[J" || arrayClass == "[D") return 8;
-    if (arrayClass == "[C" || arrayClass == "[S" || arrayClass == "[I" || arrayClass == "[F") return 2;
+    if (arrayClass == "[I" || arrayClass == "[F") return 4;
+    if (arrayClass == "[C" || arrayClass == "[S") return 2;
     return 1;
 }
 
@@ -1681,7 +1685,8 @@ inline void installSkeletons(JniEnv& env)
     putHook(env, "SetFloatArrayRegion", regionHook(true));
     putHook(env, "SetDoubleArrayRegion", regionHook(true));
 
-    // Elements/Critical:副本物化,Release 按 mode 写回(0/1 写回,JNI_ABORT 丢弃)。
+    // Elements/Critical:副本物化。Release 按 JNI 契约处理 mode:0=写回+回收,
+    // JNI_COMMIT(1)=写回不回收,JNI_ABORT(2)=丢弃副本只回收。
     auto getElementsHook = [](JniCall& call) -> Result<u64, Bail> {
         Result<SimValue, Bail> v = call.env.pool.deref(call.args[0]);
         if (!v.isOk()) return Result<u64, Bail>::err(v.error());
@@ -1707,25 +1712,28 @@ inline void installSkeletons(JniEnv& env)
     };
     auto releaseElementsHook = [](JniCall& call) -> Result<u64, Bail> {
         const u64 mode = call.args[2];
-        if ((mode & 1) != 0) return Result<u64, Bail>::ok(0); // JNI_ABORT:丢弃副本
-        Result<SimValue, Bail> v = call.env.pool.deref(call.args[0]);
-        if (!v.isOk()) return Result<u64, Bail>::err(v.error());
-        auto it = call.env.session->heap.find(v.value().ref.objId);
-        if (it == call.env.session->heap.end()) {
-            return Result<u64, Bail>::err({Bail::Reason::BadOperand, 0, "数组堆对象缺失"});
+        const bool doCopyBack = mode != 2;             // JNI_ABORT(2):丢弃副本
+        const bool doFree = mode != 1;                 // JNI_COMMIT(1):写回不回收
+        if (doCopyBack) {
+            Result<SimValue, Bail> v = call.env.pool.deref(call.args[0]);
+            if (!v.isOk()) return Result<u64, Bail>::err(v.error());
+            auto it = call.env.session->heap.find(v.value().ref.objId);
+            if (it == call.env.session->heap.end()) {
+                return Result<u64, Bail>::err({Bail::Reason::BadOperand, 0, "数组堆对象缺失"});
+            }
+            HeapObj& arr = it->second;
+            const usize w = detail::elemWidthOf(arr.className);
+            const usize n = arr.elems.size();
+            std::vector<u8> buf(n * w);
+            Result<void, Bail> r = call.env.mem.read(call.args[1], buf.data(), buf.size());
+            if (!r.isOk()) return Result<u64, Bail>::err(r.error());
+            for (usize i = 0; i < n; ++i) {
+                u64 raw = 0;
+                for (usize b = 0; b < w; ++b) raw |= static_cast<u64>(buf[i * w + b]) << (b * 8);
+                arr.elems[i] = static_cast<i64>(raw);
+            }
         }
-        HeapObj& arr = it->second;
-        const usize w = detail::elemWidthOf(arr.className);
-        const usize n = arr.elems.size();
-        std::vector<u8> buf(n * w);
-        Result<void, Bail> r = call.env.mem.read(call.args[1], buf.data(), buf.size());
-        if (!r.isOk()) return Result<u64, Bail>::err(r.error());
-        for (usize i = 0; i < n; ++i) {
-            u64 raw = 0;
-            for (usize b = 0; b < w; ++b) raw |= static_cast<u64>(buf[i * w + b]) << (b * 8);
-            arr.elems[i] = static_cast<i64>(raw);
-        }
-        if (call.env.mem.free != nullptr) call.env.mem.free(call.args[1]);
+        if (doFree && call.env.mem.free != nullptr) call.env.mem.free(call.args[1]);
         return Result<u64, Bail>::ok(0);
     };
     putHook(env, "GetBooleanArrayElements", getElementsHook);

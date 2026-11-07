@@ -4,9 +4,10 @@
 /// 职责只有三件,JNI 语义全在纯层(jni.hpp):
 /// 1. 物化:JNIEnv 函数表与 trap page 落进 guest 内存。表第 i 项指向 trap page
 ///    内唯一地址,机器码调表即落 stub,UC_HOOK_CODE 截获后按地址差还原函数号。
-/// 2. ABI 编组:整数/浮点寄存器文件各按序消费(Win64 4+4,SysV 6+8),溢出实参
-///    按 C 位置落栈(Win64 先垫 0x20 影子空间);返回值按 FuncMeta::Ret 写 RAX
-///    或 XMM0。bare Call*Method 这类变长入口按 Win64 变长约定浮点走整数文件。
+/// 2. ABI 编组:Win64 位置制(前四槽 = RCX/RDX/R8/R9 与 XMM0..3 同槽,溢出实参
+///    自第 5 槽落栈,先垫 0x20 影子空间);SysV 类计数制(整数 6 + 浮点 8 各自按
+///    序,耗尽后按落栈序占 8 字节槽);返回值按 FuncMeta::Ret 写 RAX 或 XMM0。
+///    bare Call*Method 这类变长入口按 Win64 变长约定浮点走整数文件。
 /// 3. 熔断与停机:uc_emu_start 步数上限(JniEnv::maxSteps)防死循环;guest 坏
 ///    访存(含解引用句柄——句柄区故意不映射)转 Bail{BadOperand}。
 ///
@@ -235,17 +236,47 @@ private:
         return kXmm[k];
     }
 
-    /// 栈上实参:C 位置 p 的溢出槽。截获点在 stub 首指令,[RSP] = 返回地址。
-    /// Win64 溢出自 p=4 起且先垫 0x20 影子空间;SysV 自 p=6 起。
-    Result<u64, Bail> stackArg(usize p)
+    /// Win64 栈上实参:位置制——前四槽走寄存器,p≥4 落栈,先垫 0x20 影子空间
+    /// (截获点在 stub 首指令,[RSP] = 返回地址,C 位置 4 = 第 5 参)。
+    Result<u64, Bail> stackArgWin(usize p)
     {
         Result<u64, Bail> rsp = regRead(UC_X86_REG_RSP);
         if (!rsp.isOk()) return rsp;
-        const u64 off = isWin64() ? 0x28 + (p - 4) * 8 : 8 + (p - 6) * 8;
+        const u64 off = 0x28 + (p - 4) * 8;
         u64 v = 0;
         uc_err err = uc_mem_read(uc_, rsp.value() + off, &v, 8);
         if (err != UC_ERR_OK) return Result<u64, Bail>::err(ucBail("uc_mem_read 栈实参", err));
         return Result<u64, Bail>::ok(v);
+    }
+
+    /// SysV 栈上实参:槽位制——栈槽按已落栈实参个数计(寄存器按类耗尽后才落
+    /// 栈,与位置无关;混类时位置差≠栈槽差)。
+    Result<u64, Bail> stackArgSlot(usize slot)
+    {
+        Result<u64, Bail> rsp = regRead(UC_X86_REG_RSP);
+        if (!rsp.isOk()) return rsp;
+        const u64 off = 8 + slot * 8;
+        u64 v = 0;
+        uc_err err = uc_mem_read(uc_, rsp.value() + off, &v, 8);
+        if (err != UC_ERR_OK) return Result<u64, Bail>::err(ucBail("uc_mem_read 栈实参", err));
+        return Result<u64, Bail>::ok(v);
+    }
+
+    /// SysV:C 位置 p 之前的实参里,按类计数耗尽寄存器后落栈的个数(即 p 的栈槽)。
+    usize sysVStackSlot(usize p) const
+    {
+        usize slot = 0, ints = 0, flts = 0;
+        for (usize i = 0; i < p && i < classes_.size(); ++i) {
+            if (classes_[i] != 0) {
+                if (flts < 8) ++flts;
+                else ++slot;
+            } else if (ints < 6) {
+                ++ints;
+            } else {
+                ++slot;
+            }
+        }
+        return slot;
     }
 
     usize countClass(usize p, char want) const
@@ -257,7 +288,8 @@ private:
         return k;
     }
 
-    /// dispatch 的参数面(SysV):按 argClassesOf 的类表分寄存器文件,溢出落栈。
+    /// dispatch 的参数面(SysV):寄存器按类序(整数 6 / 浮点 8 各自计数),
+    /// 溢出按栈槽计数落栈——都是类计数制,不是位置制。
     Result<u64, Bail> readSysV(usize p, bool wantFloat)
     {
         if (wantFloat) {
@@ -267,7 +299,7 @@ private:
             const usize k = countClass(p, 0);
             if (k < 6) return regRead(kSysVIntRegs[k]);
         }
-        return stackArg(p);
+        return stackArgSlot(sysVStackSlot(p));
     }
 
     // ---- trap 分发 ---------------------------------------------------------------
@@ -288,7 +320,7 @@ private:
                 // 都按位置走整数文件:定长函数无浮点参数,变长调用的浮点按变长
                 // 约定进整数寄存器。
                 if (p < 4) return regRead(kWinIntRegs[p]);
-                return stackArg(p);
+                return stackArgWin(p);
             }
             return readSysV(p, false);
         };
@@ -343,7 +375,7 @@ private:
     Result<u64, Bail> readPosWin(usize p)
     {
         if (p < 4) return regRead(kWinIntRegs[p]);
-        return stackArg(p);
+        return stackArgWin(p);
     }
 
     void writeReturn(u32 id, u64 bits)
@@ -380,30 +412,45 @@ private:
         if (err != UC_ERR_OK) return Result<u64, Bail>::err(ucBail("uc_mem_write 哨兵", err));
 
         // C 参数序列:pos0 = JNIEnv*,pos1 = 接收者/jclass,pos2.. = 实参(实参类由
-        // nr.argIsFloat 给,buildNativeRun 按 desc 填)。
-        const usize maxInt = isWin64() ? 4 : 6;
-        const usize maxFloat = isWin64() ? 4 : 8;
-        int intK = 0, fK = 0;
+        // nr.argIsFloat 给,buildNativeRun 按 desc 填)。两 ABI 分派规则不同:
+        // Win64 是位置制——前四槽 p=0..3 各对应 RCX/RDX/R8/R9 或 XMM0..3,p≥4 落
+        // 栈(0x20 影子空间 + 返回地址);SysV 是类计数制——整数/浮点寄存器各自按
+        // 序消耗,耗尽后按落栈序占 8 字节槽。混类签名下两者不可混用公式。
+        usize intK = 0, fK = 0, stackK = 0;
         for (usize p = 0; p <= nr.args.size(); ++p) {
             // v 与类:pos0 取 envTable,pos1 取 nr.args[0](恒整),pos2+ 取实参。
             const u64 v = (p == 0) ? layout_.envTable : nr.args[p - 1];
             const bool isFloat =
                 p >= 2 && static_cast<usize>(p - 2) < nr.argIsFloat.size() && nr.argIsFloat[p - 2] != 0;
-            if (isFloat && static_cast<usize>(fK) < maxFloat) {
-                Result<void, Bail> r = xmmWrite(static_cast<usize>(fK++), v);
+            if (isWin64()) {
+                if (p < 4) {
+                    // 位置制:该槽浮点走 XMMp,整型走第 p 个整型寄存器(XMM 与
+                    // 整型寄存器同槽编号,不按类计数)。
+                    Result<void, Bail> r =
+                        isFloat ? xmmWrite(p, v) : regWrite(kWinIntRegs[p], v);
+                    if (!r.isOk()) return Result<u64, Bail>::err(r.error());
+                    continue;
+                }
+                err = uc_mem_write(uc_, rsp + 0x28 + (p - 4) * 8, &v, 8);
+                if (err != UC_ERR_OK) {
+                    return Result<u64, Bail>::err(ucBail("uc_mem_write 栈实参", err));
+                }
+                continue;
+            }
+            if (isFloat && fK < 8) {
+                Result<void, Bail> r = xmmWrite(fK++, v);
                 if (!r.isOk()) return Result<u64, Bail>::err(r.error());
                 continue;
             }
-            if (!isFloat && static_cast<usize>(intK) < maxInt) {
-                Result<void, Bail> r = regWrite(isWin64() ? kWinIntRegs[intK] : kSysVIntRegs[intK], v);
+            if (!isFloat && intK < 6) {
+                Result<void, Bail> r = regWrite(kSysVIntRegs[intK++], v);
                 if (!r.isOk()) return Result<u64, Bail>::err(r.error());
-                ++intK;
                 continue;
             }
-            // 溢出:按 C 位置落栈,与 onTrap 的读法同一公式。
-            const u64 off = isWin64() ? 0x28 + (p - 4) * 8 : 8 + (p - 6) * 8;
-            err = uc_mem_write(uc_, rsp + off, &v, 8);
+            // SysV 溢出:按落栈序(类计数耗尽后)占槽,与 onTrap 读法同一公式。
+            err = uc_mem_write(uc_, rsp + 8 + stackK * 8, &v, 8);
             if (err != UC_ERR_OK) return Result<u64, Bail>::err(ucBail("uc_mem_write 栈实参", err));
+            ++stackK;
         }
         Result<void, Bail> rs = regWrite(UC_X86_REG_RSP, rsp);
         if (!rs.isOk()) return Result<u64, Bail>::err(rs.error());

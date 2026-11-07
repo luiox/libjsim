@@ -719,6 +719,160 @@ void testResolverBoundary()
     CHECK(r.bail.reason == Bail::Reason::UnsupportedCall); // 核心口径,不静默
 }
 
+// ── 数组族:宽度、Region 直通、Elements 副本与 Release mode ─────────────────
+
+/// 造一个堆数组对象,返回 (objId, 句柄)。
+std::pair<u64, u64> putArray(Session& s, jni::JniEnv& env, const char* cls, std::vector<i64> elems)
+{
+    const u64 id = s.nextAllocId++;
+    HeapObj obj;
+    obj.className = cls;
+    obj.elems = std::move(elems);
+    s.heap[id] = std::move(obj);
+    Result<u64, Bail> h = env.pool.makeRef(SimValue::knownObj(id), false);
+    CHECK(h.isOk());
+    return {id, h.value()};
+}
+
+void testArrayRegionWidth()
+{
+    Session s;
+    jni::JniEnv env;
+    env.session = &s;
+    FakeMem mem;
+    env.mem = mem.face();
+    jni::installSkeletons(env);
+    const auto [id, arr] = putArray(s, env, "[I", {1, 2, 0x11223344});
+
+    // SetIntArrayRegion(env, arr, start=1, len=2, buf):两个 jint 按宽度 4 落堆。
+    const u32 patch[2] = {0xAABBCCDDu, 0x55667788u};
+    const u64 bufAddr = mem.putBytes(patch, sizeof(patch));
+    std::vector<u64> setFixed = {0, arr, 1, 2, bufAddr}; // 下标 = C 位置
+    auto setReader = [setFixed](usize p) -> Result<u64, Bail> {
+        return p < setFixed.size() ? Result<u64, Bail>::ok(setFixed[p])
+                                   : Result<u64, Bail>::err({Bail::Reason::StackBroken, 0, "越位"});
+    };
+    Result<u64, Bail> set =
+        jni::dispatch(env, jni::indexOf("SetIntArrayRegion"), setReader, setReader);
+    CHECK(set.isOk());
+    CHECK(s.heap[id].elems.size() == 3);
+    if (s.heap[id].elems.size() == 3) {
+        CHECK(s.heap[id].elems[1] == static_cast<i64>(0xAABBCCDDu));
+        CHECK(s.heap[id].elems[2] == static_cast<i64>(0x55667788u));
+    }
+
+    // GetIntArrayRegion(env, arr, start=2, len=1, buf):低 4 字节小端原样出堆。
+    u8 out[4] = {};
+    const u64 outAddr = mem.putBytes(out, sizeof(out));
+    std::vector<u64> getFixed = {0, arr, 2, 1, outAddr};
+    auto getReader = [getFixed](usize p) -> Result<u64, Bail> {
+        return p < getFixed.size() ? Result<u64, Bail>::ok(getFixed[p])
+                                   : Result<u64, Bail>::err({Bail::Reason::StackBroken, 0, "越位"});
+    };
+    Result<u64, Bail> get =
+        jni::dispatch(env, jni::indexOf("GetIntArrayRegion"), getReader, getReader);
+    CHECK(get.isOk());
+    u8 got[4] = {};
+    CHECK(mem.face().read(outAddr, got, 4).isOk());
+    CHECK(got[0] == 0x88 && got[1] == 0x77 && got[2] == 0x66 && got[3] == 0x55);
+}
+
+void testArrayElementsReleaseModes()
+{
+    // [B 隔离宽度因素,只验 Release 的 mode 语义。
+    for (u64 mode = 0; mode <= 2; ++mode) {
+        Session s;
+        jni::JniEnv env;
+        env.session = &s;
+        FakeMem mem;
+        env.mem = mem.face();
+        jni::installSkeletons(env);
+        const auto [id, arr] = putArray(s, env, "[B", {1, 2});
+
+        std::vector<u64> getFixed = {0, arr, 0}; // isCopy* = NULL
+        auto getReader = [getFixed](usize p) -> Result<u64, Bail> {
+            return p < getFixed.size() ? Result<u64, Bail>::ok(getFixed[p])
+                                       : Result<u64, Bail>::err({Bail::Reason::StackBroken, 0, "越位"});
+        };
+        Result<u64, Bail> copy =
+            jni::dispatch(env, jni::indexOf("GetByteArrayElements"), getReader, getReader);
+        CHECK(copy.isOk());
+        if (!copy.isOk()) continue;
+
+        // native 改副本 {9,9},再按 mode 释放。
+        const u8 patch[2] = {9, 9};
+        CHECK(mem.face().write(copy.value(), patch, 2).isOk());
+        std::vector<u64> relFixed = {0, arr, copy.value(), mode};
+        auto relReader = [relFixed](usize p) -> Result<u64, Bail> {
+            return p < relFixed.size() ? Result<u64, Bail>::ok(relFixed[p])
+                                       : Result<u64, Bail>::err({Bail::Reason::StackBroken, 0, "越位"});
+        };
+        Result<u64, Bail> rel =
+            jni::dispatch(env, jni::indexOf("ReleaseByteArrayElements"), relReader, relReader);
+        CHECK(rel.isOk());
+
+        // 契约:0=写回+回收,JNI_COMMIT(1)=写回不回收,JNI_ABORT(2)=丢弃。
+        const bool wroteBack = s.heap[id].elems[0] == 9 && s.heap[id].elems[1] == 9;
+        CHECK(wroteBack == (mode != 2));
+        // 回收:mode 1 不回收(块仍在),0/2 回收(读越界)。
+        u8 probe = 0;
+        const bool freed = !mem.face().read(copy.value(), &probe, 1).isOk();
+        CHECK(freed == (mode != 1));
+    }
+}
+
+// ── 实例字段桥:GetFieldID → Get/SetIntField 直连 HeapObj.fields ─────────────
+
+void testInstanceFieldBridge()
+{
+    Session s;
+    jni::JniEnv env;
+    env.session = &s;
+    FakeMem mem;
+    env.mem = mem.face();
+    jni::installSkeletons(env);
+
+    // GetFieldID(env, clazz, "x", "I")。
+    const u64 cid = s.classObjectOf("sample/Box");
+    Result<u64, Bail> clazz = env.pool.makeRef(SimValue::knownObj(cid), false);
+    CHECK(clazz.isOk());
+    std::vector<u64> fidFixed = {0, clazz.value(), mem.putCStr("x"), mem.putCStr("I")};
+    auto fidReader = [fidFixed](usize p) -> Result<u64, Bail> {
+        return p < fidFixed.size() ? Result<u64, Bail>::ok(fidFixed[p])
+                                   : Result<u64, Bail>::err({Bail::Reason::StackBroken, 0, "越位"});
+    };
+    Result<u64, Bail> fid = jni::dispatch(env, jni::indexOf("GetFieldID"), fidReader, fidReader);
+    CHECK(fid.isOk());
+
+    // 实例对象带 fields["x::I"] = 7。
+    const u64 objId = s.nextAllocId++;
+    HeapObj obj;
+    obj.className = "sample/Box";
+    obj.fields["x::I"] = SimValue::knownI32(7);
+    s.heap[objId] = std::move(obj);
+    Result<u64, Bail> objH = env.pool.makeRef(SimValue::knownObj(objId), false);
+    CHECK(objH.isOk());
+
+    // GetIntField(env, obj, fid) → 7;SetIntField(env, obj, fid, 777) → 堆可写。
+    std::vector<u64> getFixed = {0, objH.value(), fid.value()};
+    auto getReader = [getFixed](usize p) -> Result<u64, Bail> {
+        return p < getFixed.size() ? Result<u64, Bail>::ok(getFixed[p])
+                                   : Result<u64, Bail>::err({Bail::Reason::StackBroken, 0, "越位"});
+    };
+    Result<u64, Bail> got = jni::dispatch(env, jni::indexOf("GetIntField"), getReader, getReader);
+    CHECK(got.isOk() && static_cast<i32>(got.value()) == 7);
+
+    std::vector<u64> setFixed = {0, objH.value(), fid.value(), 777};
+    auto setReader = [setFixed](usize p) -> Result<u64, Bail> {
+        return p < setFixed.size() ? Result<u64, Bail>::ok(setFixed[p])
+                                   : Result<u64, Bail>::err({Bail::Reason::StackBroken, 0, "越位"});
+    };
+    Result<u64, Bail> put = jni::dispatch(env, jni::indexOf("SetIntField"), setReader, setReader);
+    CHECK(put.isOk());
+    CHECK(s.heap[objId].fields["x::I"].known &&
+          static_cast<i32>(s.heap[objId].fields["x::I"].asU32()) == 777);
+}
+
 } // namespace
 
 int main()
@@ -737,6 +891,9 @@ int main()
     testRegisterNatives();
     testArgClasses();
     testResolverBoundary();
+    testArrayRegionWidth();
+    testArrayElementsReleaseModes();
+    testInstanceFieldBridge();
 
     std::printf("jsim-jni-test: %d/%d 通过\n", g_total - g_fail, g_total);
     return g_fail == 0 ? 0 : 1;

@@ -44,7 +44,7 @@ j2c 混淆器把 Java 方法编译成 native 函数,体内经 JNIEnv 函数表�
 
 **句柄池**:句柄是 8 对齐单调发号的假 guest 指针,不对应任何真实内存,绑定层不为它映射页。ref 句柄背 SimValue(Null/Str/Obj 载荷),memberID 句柄背 (owner, name, desc)。local 句柄一次 native 调用结束统一回收,global 句柄(NewGlobalRef)跨调用持久——缓存 jclass 的解密器依赖这一点。悬空句柄一律 Bail{BadOperand}。
 
-**内存物化**:GetStringUTFChars / GetStringChars / Get*ArrayElements / Get*Critical 在 scratch 区物化一份副本,返回 guest 指针,Release* 系回收;写回语义(Set*ArrayElements 带 isCopy=false 时)按副本写回堆。Get*Region / Set*Region 系不经副本直通 Session 堆。字符串字节按家族口径 MUTF-8 原样透传(GetStringUTFChars 不转码);GetStringChars / GetStringLength 按 UTF-16 码元解码(BMP 假设,同 jsim-str 家族口径)。
+**内存物化**:GetStringUTFChars / GetStringChars / Get*ArrayElements / Get*Critical 在 scratch 区物化一份副本,返回 guest 指针。Release\*ArrayElements 按 JNI 契约处理 mode:0=写回+回收,JNI_COMMIT(1)=写回不回收,JNI_ABORT(2)=丢弃副本只回收。Get*Region / Set*Region 系不经副本直通 Session 堆,元素宽度按数组类名([Z/[B=1,[C/[S=2,[I/[F=4,[J/[D=8)。字符串字节按家族口径 MUTF-8 原样透传(GetStringUTFChars 不转码);GetStringChars / GetStringLength 按 UTF-16 码元解码(BMP 假设,同 jsim-str 家族口径)。
 
 **字段与类桥接**:GetStaticXField / SetStaticXField 直连 `Session.statics`,GetXField / SetXField 直连 `HeapObj.fields`,与 jsim 字段面同键同口径——native 侧和字节码侧读写同一份状态。FindClass / GetObjectClass 走 `session.classObjectOf`,与 ldc 类常量同一个对象。
 
@@ -89,11 +89,17 @@ jsim::RunResult r = jsim::Sim(m.value(), session).runEntry(std::move(p), 1u << 1
 
 ## 测试
 
-- `jsim-jni-test`(独立 target):FakeMachine 驱动纯层。FakeMachine 是一段预编脚本(假 native 依次发起的 JNI 调用 + 最终返回值),驱动 dispatch 与编组,覆盖:骨架逐条、句柄池生命周期、异常位、参数编组对拍、用户钩子覆盖优先级、未实现函数 Bail。期望值由测试用同算法独立复算,同 jsim-jbc-test 纪律。
+- `jsim-jni-test`(独立 target):FakeMachine 驱动纯层。FakeMachine 是一段预编脚本(假 native 依次发起的 JNI 调用 + 最终返回值),驱动 dispatch 与编组,覆盖:函数表与描述符工具、句柄池生命周期、异常位、参数编组对拍、用户钩子覆盖优先级、RegisterNatives 录表、数组族([I Region 宽度与往返、Elements 副本 + Release 三 mode)、实例字段桥、未实现函数 Bail。期望值由测试用同算法独立复算,同 jsim-jbc-test 纪律。
 - `jsim-demo-jni`(端到端):手写 x64 Win64 机器码的 native 方法(GetStringUTFChars → XOR 循环 → NewStringUTF),jsim 字节码 invokestatic 发起,走完整链还原明文;兼作绑定层的真机验证。期望值 C++ 独立复算。
 - `jsim-jni-e2e-test`(真实样本端到端):语料 jar `test/corpus/jni/jni-sample.jar` 是**构建产物,不入库**,内含真实 MSVC 编译的 `decrypt.dll`(样本源在 `test/jni/sample/`,自包含 C 源 `decrypt_jni.c`);jar 缺失时整条 E2E 跳过并提示再生成命令。测试读 jar 条目(libjzip)→ 按字节偏移解析 PE64、在首选基址展开映像、走导出表定位 `Java_sample_Decrypt_decrypt`(消费方装载职责的参考实现)→ jsim-jbc 桥出 `Caller.run` 字节码 → invokestatic → unicorn 跑真机器码 → 明文还原。**真机对拍腿**:同 jar 同 DLL 交给本机 HotSpot 跑一遍,两边输出必须一致——这条腿曾抓出 env 双重间接约定错位,是纯模拟自证不能替代的证据(本机无 JDK 时该腿单独跳过)。
 - 样本再生成:`test/jni/sample/build-sample.ps1`(vswhere 定位 MSVC,javac --release 8,cl/link 产出非 FIXED 基址 DLL,打 jar);也可 `gradle sampleJar`(build.gradle,CI 环境)。产出的 jar 覆盖 `test/corpus/jni/jni-sample.jar`。
 - 核心回归:jsim-test 90 项 / jsim-jbc-test 108 项既有断言不破(本轮为 jsim-jni 在 engine.hpp 加了 Result&lt;void,E&gt; 特化,已回归)。
 
 **JNI C 字符串口径**:GetStringUTFChars 契约是 NUL 终止的 C 字符串——实参字符串里首个 NUL 之后的内容不可往返(NewStringUTF 重建即截断),HotSpot 真机同口径。涉及含 0x00 字节的密文样本时,期望值须按首个 NUL 截断后比对,这是 ABI 事实而非缺陷。
+
+## 已知限制(v1)
+
+- **嵌套 native 不可重入**:javaInvoker 回跳开嵌套 Sim 时,若被调链路再进一个 native 方法,会在同一 unicorn 引擎上嵌套 `uc_emu_start`——引擎不可重入。消费方的 javaInvoker 编排里,嵌套层只跑字节码方法或以 callMocks 截住,不落机器执行;解禁需要执行器做上下文保存或第二引擎,记入后续版本。
+- **SysV 的 CallNonvirtual\* 不可达**:`argClassesOf` 对 `Call*` 前缀一律按 bare 变体取位置 2 当 jmethodID,而 Nonvirtual 的 jmethodID 在位置 3(位置 2 是 jclass),SysV 类布局路径会在进钩子前 Bail;Win64 位置式读取不受影响。j2c 样本几乎不走 Nonvirtual,需要时用用户钩子按位置自取。
+- **demo 手写机器码在 Release 后读副本**:`demo/jni/main.cpp` 的机器码先 ReleaseStringUTFChars 再用同一缓冲区 NewStringUTF,依赖绑定层回收不擦除副本内容才成立(C 样本 `decrypt_jni.c` 已修正为先复制再 Release)。改法是把 NewStringUTF 挪到 Release 之前,留待下一次机器码调整时一并做。
 
