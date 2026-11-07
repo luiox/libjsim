@@ -1,5 +1,5 @@
 /// @file test/jni/main.cpp
-/// @brief jsim-jni 纯层测试:FakeMachine 驱动(docs/ext-jni.md 测试节)。
+/// @brief jsim-jni 纯层测试:FakeMachine 驱动(doc:ext-jni 测试节)。
 ///        覆盖:函数表、描述符工具、句柄池、native mock 编组、骨架逐条、
 ///        异常位、用户钩子覆盖、RegisterNatives 录表、未实现函数 Bail。
 ///        期望值由本文件用同算法独立复算,不以被测件自身输出为基准。

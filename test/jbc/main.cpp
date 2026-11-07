@@ -1,5 +1,5 @@
 /// @file test/jbc/main.cpp
-/// @brief jsim-jbc 桥接测试（设计 §9(2)：扩展包每条面一测）：合成 class 语料
+/// @brief jsim-jbc 桥接测试（doc:design-testing(2)：扩展包每条面一测）：合成 class 语料
 ///        （test/corpus/JsimJbcBridgeSample.class，javac --release 8 产物 v52）
 ///        → libjbc 会话 → jbcbridge::toSimMethod → jsim 执行，期望值由本文件
 ///        用同算法独立复算，不以桥自身输出为基准。运行期不需要 JDK。

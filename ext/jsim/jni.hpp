@@ -1,5 +1,6 @@
 /// @file jni.hpp
-/// @brief jsim-jni 扩展包纯层(设计 docs/ext-jni.md):本地方法接管的接缝与
+/// @defgroup jni jsim-jni 本地方法纯层
+/// @brief jsim-jni 扩展包纯层(doc:ext-jni):本地方法接管的接缝与
 ///        常用 mock 骨架。
 ///
 /// j2c 混淆器把 Java 方法编成 native,体内经 JNIEnv 函数表回调 JNI。本包把这条
@@ -12,11 +13,11 @@
 /// - 本文件零外部依赖,可独立测试(FakeMachine 预编脚本驱动 dispatch);
 /// - JNI 函数表按 JDK 8 冻结布局(233 项,索引 0..3 保留),这是 j2c 家族的
 ///   固定锚点:锚 ABI,不锚混淆器形态;
-/// - 句柄池、字段/类桥接、异常位、观测口径见 docs/ext-jni.md。
+/// - 句柄池、字段/类桥接、异常位、观测口径见 doc:ext-jni。
 ///
 /// 接入:
 ///   jsim::jni::JniEnv env;
-///   env.session = &session;
+///   env.session = \&session;
 ///   env.mem = ...;                  // GuestMemory 实现(绑定层或测试)
 ///   env.executor.run = ...;         // 本机执行器(绑定层或测试)
 ///   env.methods["sample/D.f()I"] = {entry, abi};   // 键 = 内部名.方法名+desc
@@ -1098,7 +1099,7 @@ inline Result<u64, Bail> callMethodImpl(JniCall& call, bool isStatic, int varian
     return Result<u64, Bail>::ok(bits2.value());
 }
 
-/// NewObject 家族:分配空壳(类名来自 jmethodID 的 owner),<init> 经 javaInvoker
+/// NewObject 家族:分配空壳(类名来自 jmethodID 的 owner),\<init> 经 javaInvoker
 /// 跑(构造语义属消费方)。variant 同 callMethodImpl。
 inline Result<u64, Bail> newObjectImpl(JniCall& call, int variant)
 {
@@ -1145,7 +1146,7 @@ inline Result<u64, Bail> newObjectImpl(JniCall& call, int variant)
         if (!b.isOk()) return Result<u64, Bail>::err(b.error());
         bits = std::move(b.value());
     }
-    // 实参按 <init> 的 desc 解码(this 不在 desc 里,解码后前插)。
+    // 实参按 \<init> 的 desc 解码(this 不在 desc 里,解码后前插)。
     Result<std::vector<SimValue>, Bail> argv = detail::decodeArgs(m.desc, bits, env);
     if (!argv.isOk()) return Result<u64, Bail>::err(argv.error());
     argv.value().insert(argv.value().begin(), SimValue::knownObj(id));
@@ -1162,7 +1163,7 @@ inline Result<u64, Bail> newObjectImpl(JniCall& call, int variant)
     return Result<u64, Bail>::ok(selfHandle);
 }
 
-/// 注册默认骨架。约 40 个函数按解密场景的调用频度选;覆盖面见 docs/ext-jni.md。
+/// 注册默认骨架。约 40 个函数按解密场景的调用频度选;覆盖面见 doc:ext-jni。
 /// 幂等:只补缺,不覆盖用户钩子。
 inline void installSkeletons(JniEnv& env)
 {
@@ -1781,7 +1782,7 @@ inline void installSkeletons(JniEnv& env)
         return Result<u64, Bail>::ok(0); // v1 不清表(j2c 注册一次跑全程)
     });
     putHook(env, "MonitorEnter", [](JniCall&) -> Result<u64, Bail> {
-        return Result<u64, Bail>::ok(0); // monitor 不进模型(设计 §11)
+        return Result<u64, Bail>::ok(0); // monitor 不进模型(doc:design-v1-scope)
     });
     putHook(env, "MonitorExit", [](JniCall&) -> Result<u64, Bail> {
         return Result<u64, Bail>::ok(0);
@@ -1802,7 +1803,7 @@ inline void installSkeletons(JniEnv& env)
         return call.env.pool.makeRef(SimValue::knownObj(id), false);
     });
     putHook(env, "IsInstanceOf", [](JniCall& call) -> Result<u64, Bail> {
-        // 无类型层次:同对象判真,其余判假并留观测(docs/ext-jni.md 口径)。
+        // 无类型层次:同对象判真,其余判假并留观测(doc:ext-jni 口径)。
         const bool same = call.env.pool.sameObject(call.args[0], call.args[1]);
         if (!same && call.env.trace) call.env.trace("[JNI] IsInstanceOf 无类型层次,按身份判定");
         return Result<u64, Bail>::ok(same ? 1 : 0);

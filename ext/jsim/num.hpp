@@ -1,4 +1,5 @@
 /// @file num.hpp
+/// @defgroup num jsim-num 包装类型与解析包
 /// @brief jsim-num 扩展包：包装类型（Integer/Long）与十进制解析。
 ///
 /// 这些是 JDK 语义，不在核心（设计 D10）。混淆器的元数据契约里 `Integer`

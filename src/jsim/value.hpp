@@ -1,5 +1,6 @@
 /// @file value.hpp
-/// @brief SimValue 三要素：类型、是否已知、值（设计 §3）。
+/// @defgroup value SimValue 值代数
+/// @brief SimValue 三要素：类型、是否已知、值（doc:design-value）。
 
 #pragma once
 

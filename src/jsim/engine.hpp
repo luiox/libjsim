@@ -1,5 +1,6 @@
 /// @file engine.hpp
-/// @brief 单方法引擎（设计 §5）：入口、预填、类型传播主循环、接管面、Bail。
+/// @defgroup engine 单方法引擎
+/// @brief 单方法引擎（doc:design-single）：入口、预填、类型传播主循环、接管面、Bail。
 
 #pragma once
 
@@ -68,7 +69,7 @@ private:
     E error_{};
 };
 
-/// 结构化失败（设计 §1 失败面）。Bail 是一等公民：带原因码、pc 与现场说明，
+/// 结构化失败（doc:design-positioning 失败面）。Bail 是一等公民：带原因码、pc 与现场说明，
 /// 调用方决定降级策略；框架不崩溃、不静默走错。步数超限走 RunResult::LimitHit，
 /// 不经 Bail。
 struct Bail {
@@ -114,7 +115,7 @@ struct StepView {
     const Session* session = nullptr;
 };
 
-/// 完整进入帧视图（设计 §6 红线：钩子与接管收完整帧，引擎不预弹栈）。
+/// 完整进入帧视图（doc:design-takeover 红线：钩子与接管收完整帧，引擎不预弹栈）。
 class Frame {
 public:
     Frame(std::vector<SimValue>& stack, std::vector<SimValue>& locals, u32 pc,
@@ -158,21 +159,21 @@ private:
     Session* session_ = nullptr;
 };
 
-/// 调用接管：扩展包与用户走同一注册面（设计 §6/§7），核心无特权内建。
+/// 调用接管：扩展包与用户走同一注册面（doc:design-takeover/design-packages），核心无特权内建。
 /// 返回 Known/Unknown 值即接管语义；返回 Bail 即该调用点无法继续。
 using CallMock = std::function<Result<SimValue, Bail>(Frame&)>;
 
-/// 字段接管（设计 §6）：get 系返回注入值（引擎按描述符定型压栈），put 系自行
+/// 字段接管（doc:design-takeover）：get 系返回注入值（引擎按描述符定型压栈），put 系自行
 /// 经 Frame 弹栈记录、返回值被忽略。get/put 共用一个键，接管方按
 /// frame.method().code[frame.pc()].opcode 区分指令。
 using FieldMock = std::function<Result<SimValue, Bail>(Frame&)>;
 
-/// 分支接管（设计 §4.4 三态）：返回 true/false 即单边裁决，返回 Bail 即放弃。
-/// 收完整进入帧（§6 红线）：条件操作数仍在栈上，接管方经 peekChecked 窥视；
+/// 分支接管（doc:design-typeprop 三态）：返回 true/false 即单边裁决，返回 Bail 即放弃。
+/// 收完整进入帧（doc:design-takeover 红线）：条件操作数仍在栈上，接管方经 peekChecked 窥视；
 /// 操作数由引擎在裁决后统一弹出，接管方只裁决不消费。
 using BranchHook = std::function<Result<bool, Bail>(Frame&)>;
 
-/// 指令接管的产出：只管控制流，栈由接管方经 Frame 自行操作（设计 §6 红线）。
+/// 指令接管的产出：只管控制流，栈由接管方经 Frame 自行操作（doc:design-takeover 红线）。
 struct OpOutcome {
     u32 nextPc = 0xFFFFFFFFu; ///< 0xFFFFFFFF = 顺序推进
     bool doReturn = false;
@@ -180,14 +181,14 @@ struct OpOutcome {
     SimValue returnValue;
 };
 
-/// 指令接管（设计 §6 第一行）：整条 opcode 的语义替换。
+/// 指令接管（doc:design-takeover 第一行）：整条 opcode 的语义替换。
 ///
 /// 引擎在查效应表**之前**先看这里——效应表是默认语义的索引，不是权限门。
 /// 这是「user 补环境」的最后一层口子：表里没有的 opcode 也能接管，不必等
 /// 核心补表；表里有但默认语义不够的，接管优先。
 using OpHandler = std::function<Result<OpOutcome, Bail>(Frame&)>;
 
-/// 步进观测：每条指令执行前收到结构化只读视图（设计 §6 观测面）。
+/// 步进观测：每条指令执行前收到结构化只读视图（doc:design-takeover 观测面）。
 /// 注册期过滤由观测方自行包一层完成（按 pc/opcode 忽略即可）。
 using StepObserver = std::function<void(const StepView&)>;
 
@@ -199,7 +200,7 @@ struct Session {
     std::unordered_map<u32, CallMock> callMocksAtPc;      // 按调用点注册，优先于按签名
     std::unordered_map<u8, OpHandler> opcodeHandlers;     // 指令接管，优先于效应表
     std::unordered_map<u32, BranchHook> branchHooks;      // 分支接管，按 pc
-    std::unordered_map<std::string, FieldMock> fieldMocks; // 字段接管，键 = owner.name+desc（§6）
+    std::unordered_map<std::string, FieldMock> fieldMocks; // 字段接管，键 = owner.name+desc（design-takeover）
     std::unordered_map<std::string, std::function<std::string()>> allocScaffolds; // 类名 → 初始载荷工厂
     std::unordered_map<u64, HeapObj> heap;
     std::unordered_map<std::string, SimValue> statics;    // 键 = owner::name::desc
@@ -263,11 +264,11 @@ struct Limits {
     static constexpr u32 kNoStopPc = 0xFFFFFFFFu;
 
     u64 maxSteps = 4096;
-    /// 合并点栈形一致性校验（设计 §5）：同一 pc 二次到达时深度或类型序列
+    /// 合并点栈形一致性校验（doc:design-single）：同一 pc 二次到达时深度或类型序列
     /// 不一致即 Bail{StackBroken}。关闭时引擎信任预填与接管方。
     bool checkBalance = false;
     /// 区间模式容忍域外出口：越过方法尾按 Completed(void) 收尾而不是 Bail
-    /// （设计 §5「容忍预填栈与域外出口」）。
+    /// （doc:design-single「容忍预填栈与域外出口」）。
     bool tolerateOffEnd = false;
     /// 断点熔断（观测面）：执行前命中即停，按 LimitHit 语义收尾并带帧快照，
     /// 配区间起步（把快照灌回 Prefill）即可续跑。
@@ -298,7 +299,7 @@ class Sim {
 public:
     Sim(const Method& method, Session& session) : method_(&method), session_(&session) {}
 
-    /// 方法入口起步（设计 §5 便利入口一）：pc = 0，栈平衡校验默认开。
+    /// 方法入口起步（doc:design-single 便利入口一）：pc = 0，栈平衡校验默认开。
     RunResult runEntry(Prefill prefill, u64 maxSteps = 4096) {
         Limits lim;
         lim.maxSteps = maxSteps;
@@ -306,7 +307,7 @@ public:
         return run(0, std::move(prefill), lim);
     }
 
-    /// 区间起步（设计 §5 便利入口二）：任意 pc，栈平衡默认关、容忍预填栈与
+    /// 区间起步（doc:design-single 便利入口二）：任意 pc，栈平衡默认关、容忍预填栈与
     /// 域外出口。
     RunResult runRegion(u32 entryPc, Prefill prefill, u64 maxSteps = 4096) {
         Limits lim;
@@ -333,7 +334,7 @@ public:
             stack_[slot.first] = slot.second;
         }
 
-        // 栈平衡记事（§5）：同 pc 首达记形状，再达比对深度与类型序列。
+        // 栈平衡记事（design-single）：同 pc 首达记形状，再达比对深度与类型序列。
         std::vector<char> balanceSeen;
         std::vector<std::vector<ValType>> balanceShape;
         if (limits.checkBalance) {
@@ -370,7 +371,7 @@ public:
                                         "合并点栈形不一致（深度或类型序列）"});
             }
 
-            // 指令接管优先于效应表（设计 §6）。表外 opcode 因此也能被接管，
+            // 指令接管优先于效应表（doc:design-takeover）。表外 opcode 因此也能被接管，
             // 「缺什么补什么」不必等核心补表——这是扩展包补环境的最后一层。
             auto handlerIt = session_->opcodeHandlers.find(insn.opcode);
             if (handlerIt != session_->opcodeHandlers.end()) {
@@ -458,7 +459,7 @@ private:
         }
     }
 
-    /// 合并点栈形校验（§5）：首达记录深度与类型序列，再达比对。
+    /// 合并点栈形校验（design-single）：首达记录深度与类型序列，再达比对。
     bool balancePass(u32 pc, std::vector<char>& seen, std::vector<std::vector<ValType>>& shape) {
         std::vector<ValType> current;
         current.reserve(stack_.size());
@@ -807,14 +808,14 @@ private:
             if (!popped.isOk()) return bailStep(popped.error());
             return nextStep(SimValue::unknownOf(ValType::I32));
         }
-        // monitor 不进模型（设计 §11）：按类型传播为无操作。
+        // monitor 不进模型（doc:design-v1-scope）：按类型传播为无操作。
         case op::MonitorEnter:
         case op::MonitorExit: {
             Result<SimValue, Bail> popped = popChecked(pc);
             if (!popped.isOk()) return bailStep(popped.error());
             return StepResult{};
         }
-        // athrow 需要异常表派发，v1 明确不做（设计 §11）：直接 Bail，不静默跳过。
+        // athrow 需要异常表派发，v1 明确不做（doc:design-v1-scope）：直接 Bail，不静默跳过。
         case op::AThrow: {
             Result<SimValue, Bail> popped = popChecked(pc);
             if (!popped.isOk()) return bailStep(popped.error());
@@ -916,7 +917,7 @@ private:
                                        return static_cast<u64>(-static_cast<i64>(operand));
                                    });
         // 整数除法/取余：除数为 0 时 JVM 抛 ArithmeticException，派发需要异常表
-        // （v1 不做，设计 §11）。这是「已知会发生、我们无法建模」的事件，Bail 比
+        // （v1 不做，doc:design-v1-scope）。这是「已知会发生、我们无法建模」的事件，Bail 比
         // 编一个假商诚实；操作数未知时仍按类型传播，不算也不猜。
         case op::IDiv:
         case op::IRem: {
@@ -1284,10 +1285,10 @@ private:
         }
     }
 
-    /// 分支纪律（设计 §4.4/D7）：全 Known 且身份可判才单边裁决；否则不 fork，
+    /// 分支纪律（doc:design-typeprop/D7）：全 Known 且身份可判才单边裁决；否则不 fork，
     /// 交给分支接管三态，未注册接管即 Bail{NotConcrete}。
     ///
-    /// §6 红线：引擎不预弹栈——先窥视操作数判定可裁决性，接管收完整进入帧
+    /// doc:design-takeover 红线：引擎不预弹栈——先窥视操作数判定可裁决性，接管收完整进入帧
     /// （操作数仍在栈上），裁决后由引擎统一弹出。
     StepResult executeBranch(u32 pc, const Insn& insn, const OpInfo& info) {
         std::vector<SimValue> args;
@@ -1736,7 +1737,7 @@ private:
         return field.owner + "." + field.name + field.desc;
     }
 
-    /// 字段面（设计 §6 字段接管 + 会话存贮底座）：接管优先，命中即由接管方经
+    /// 字段面（doc:design-takeover 字段接管 + 会话存贮底座）：接管优先，命中即由接管方经
     /// Frame 自己弹压（get 系返回值由引擎按描述符定型压栈，put 系忽略返回值）；
     /// 未命中走底座——静态字段 Session.statics（跨方法接力棒：clinit 先跑、后续
     /// 方法读同一 Session），实例字段挂 HeapObj.fields。缺项一律按字段类型传播

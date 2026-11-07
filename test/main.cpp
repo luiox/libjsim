@@ -1,6 +1,6 @@
 /// @file test/main.cpp
 /// @brief jsim 测试：值代数、逐类 handler、五个完备面（opcode/接管/启动/失败/观测）、
-///        扩展包每条接管一测（设计 §9）。零外部依赖的轻量断言件。
+///        扩展包每条接管一测（doc:design-testing）。零外部依赖的轻量断言件。
 
 #include <cstdio>
 
@@ -36,7 +36,7 @@ RunResult runIt(const Method& m, Session& s, Prefill p = {}, u64 maxSteps = 256)
     return Sim(m, s).run(0, std::move(p), Limits{maxSteps});
 }
 
-// ── 值代数（§3）──────────────────────────────────────────────────────────────
+// ── 值代数（design-value）──────────────────────────────────────────────────────────────
 
 void testValueAlgebra() {
     const SimValue u = SimValue::unknownOf(ValType::I64);
@@ -54,7 +54,7 @@ void testValueAlgebra() {
     CHECK(f.type == ValType::F32 && f.asF32() == 1.5f && !f.isCat2());
 }
 
-// ── 算术与转换恒等式（§9(1)：以 JVM 规范值为基准）───────────────────────────
+// ── 算术与转换恒等式（doc:design-testing(1)：以 JVM 规范值为基准）───────────────────────────
 
 void testArithmetic() {
     Session s;
@@ -126,7 +126,7 @@ void testArithmetic() {
           ua.returnValue.type == ValType::I32);
 }
 
-// ── 分支：接管收完整帧、三态裁决、acmp 身份、switch 纪律（§6）──────────────
+// ── 分支：接管收完整帧、三态裁决、acmp 身份、switch 纪律（design-takeover）──────────────
 
 void testBranchFace() {
     // Unknown 条件：未注册接管 → Bail{NotConcrete}；注册后收完整帧并可窥操作数。
@@ -148,7 +148,7 @@ void testBranchFace() {
     Session hooked;
     bool sawOperandOnStack = false;
     hooked.branchHooks[1] = [&](Frame& frame) -> Result<bool, Bail> {
-        // §6 红线：接管收完整进入帧，条件操作数仍在栈上。
+        // doc:design-takeover 红线：接管收完整进入帧，条件操作数仍在栈上。
         Result<SimValue, Bail> cond = frame.peekChecked(0);
         sawOperandOnStack = frame.stack().size() == 1 && cond.isOk() &&
                             cond.value().type == ValType::I32 && !cond.value().known;
@@ -217,7 +217,7 @@ void testBranchFace() {
           swBail.bail.reason == Bail::Reason::NotConcrete);
 }
 
-// ── 调用接管：调用点优先于签名、兜底解析链、未注册 Bail（§6）───────────────
+// ── 调用接管：调用点优先于签名、兜底解析链、未注册 Bail（design-takeover）───────────────
 
 void testCallFace() {
     Method m = MethodBuilder("c", "()I", 0)
@@ -257,7 +257,7 @@ void testCallFace() {
     CHECK(completedWith(runIt(one, chained), 5)); // 链上第二个认领
 }
 
-// ── 字段接管（§6）：注入、记录、缺项 Unknown、null 接收者纪律（§12 v0.3）───
+// ── 字段接管（design-takeover）：注入、记录、缺项 Unknown、null 接收者纪律（doc:design-patches v0.3）───
 
 void testFieldFace() {
     Session s;
@@ -329,7 +329,7 @@ void testFieldFace() {
     CHECK(propagated.kind == RunResult::Kind::Completed && !propagated.returnValue.known);
 }
 
-// ── 观测面（§6）：结构化步进、Bail 现场、帧快照、断点熔断与续跑 ─────────────
+// ── 观测面（design-takeover）：结构化步进、Bail 现场、帧快照、断点熔断与续跑 ─────────────
 
 void testObservationFace() {
     Method m = MethodBuilder("o", "(I)I", 1)
@@ -388,7 +388,7 @@ void testObservationFace() {
     CHECK(br.finalStack.size() == 1 && static_cast<i32>(br.finalStack[0].asU32()) == 1);
 }
 
-// ── 启动面（§5）：栈平衡校验、两个便利入口、域外出口容忍 ────────────────────
+// ── 启动面（design-single）：栈平衡校验、两个便利入口、域外出口容忍 ────────────────────
 
 void testStartupFace() {
     Session s;
@@ -445,7 +445,7 @@ void testStartupFace() {
           raw.bail.reason == Bail::Reason::OffMethodEnd); // raw 入口不容忍
 }
 
-// ── 数组与分配（§4/§6）：符号宽度、脚手架、multianewarray 全维分配 ──────────
+// ── 数组与分配（doc:design-typeprop/design-takeover）：符号宽度、脚手架、multianewarray 全维分配 ──────────
 
 void testArraysAndAlloc() {
     Session s;
@@ -585,7 +585,7 @@ void testArraysAndAlloc() {
           got.returnValue.ref.kind == RefPayload::Kind::Obj);
 }
 
-// ── ldc 类常量与 Class 对象 identity（§12）──────────────────────────────────
+// ── ldc 类常量与 Class 对象 identity（design-patches）──────────────────────────────────
 
 void testClassIdentity() {
     Session s;
@@ -612,7 +612,7 @@ void testClassIdentity() {
     CHECK(completedWith(runIt(diff, s), 1));
 }
 
-// ── 扩展包：jsim-str（§7 每条接管一测）──────────────────────────────────────
+// ── 扩展包：jsim-str（doc:design-packages 每条接管一测）──────────────────────────────────────
 
 void testStrPackage() {
     Session s;

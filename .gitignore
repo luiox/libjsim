@@ -6,3 +6,6 @@ test/jni/sample/*.dll
 test/jni/sample/*.exp
 test/jni/sample/*.lib
 test/corpus/jni/*.jar
+doc/_build/
+doc/_apidoc/
+.oracle-cache/

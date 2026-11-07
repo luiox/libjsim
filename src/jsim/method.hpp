@@ -1,4 +1,5 @@
 /// @file method.hpp
+/// @defgroup method 方法模型与指令集常量
 /// @brief MVP 方法模型与指令集常量。这是 libjbc CodeUnit 会话面的替身桩，
 ///        接入后由 promoteMethod 产出的 CodeUnit 换掉本文件，引擎面不变。
 

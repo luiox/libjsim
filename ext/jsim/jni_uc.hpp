@@ -1,5 +1,6 @@
 /// @file jni_uc.hpp
-/// @brief jsim-jni 绑定层(docs/ext-jni.md):unicorn x86-64(Win64 + SysV)。
+/// @defgroup jni_uc jsim-jni unicorn 绑定层
+/// @brief jsim-jni 绑定层(doc:ext-jni):unicorn x86-64(Win64 + SysV)。
 ///
 /// 职责只有三件,JNI 语义全在纯层(jni.hpp):
 /// 1. 物化:JNIEnv 函数表与 trap page 落进 guest 内存。表第 i 项指向 trap page
