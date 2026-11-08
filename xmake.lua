@@ -23,8 +23,14 @@ local unicorn_dir = get_config("unicorn_dir")
 if unicorn_dir == nil then unicorn_dir = "" end
 
 -- 官方 xmake-repo 依赖只在走网络路径时装载;--unicorn_dir 旁路时完全不触网。
+-- archs 裁到 x86:本仓 unicorn 消费面只有 x86-64(jni_uc Win64/SysV 编组、
+-- e2e 手写 x64 机器码),aarch64 纯死重;不开它还规避一个 Windows 链接坑——
+-- unicorn 把 qemu/util/crc32c.c 无条件编进静态库(导出 crc32c 与裸 crc32),
+-- 其 aarch64 CRC 助手引用这组符号,把该 obj 拉进链接闭包,与 libjzip 传递
+-- 依赖 zlib 的 crc32 撞名(LNK2005/LNK1169);x86 的 CRC32 助手自带位循环,
+-- 不引用这组符号,该 obj 保持惰性不进闭包。
 if unicorn_dir == "" then
-    add_requires("unicorn 2.1.4")
+    add_requires("unicorn 2.1.4", { configs = { archs = { "x86" } } })
 end
 
 -- 核心零外部依赖（doc:design-testing）；扩展包逐包独立 target，按需依赖（doc:design-packages）。
