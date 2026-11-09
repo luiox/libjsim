@@ -450,7 +450,28 @@ void testMultiArray() {
           && static_cast<i32>(r.returnValue.asU32()) == 4);
 }
 
-// ── 9. LDC 字符串面：读密文（MUTF-8 原样）+ setLdcString 明文改写回读 ─────
+// ── 9. anewarray 对象分量：桥装描述符形（isRefArray/arraylength 回归）──────
+
+void testObjArrayLength() {
+    Method m = bridgeMethod("objArrayDim", "(I)I");
+    const i32 at = findInsn(m, [](const Insn& in, const Method&) {
+        return in.opcode == op::ANewArray;
+    });
+    CHECK(at >= 0);
+    if (at >= 0) {
+        // 对象分量 java/lang/String → [Ljava/lang/String;（描述符形入堆 className）。
+        const Insn& in = m.code.at(static_cast<usize>(at));
+        CHECK(m.allocTypes.at(static_cast<usize>(in.a)) == "Ljava/lang/String;");
+    }
+    Session s = makeSession();
+    Prefill p;
+    p.locals = {SimValue::knownI32(7)};
+    RunResult r = Sim(m, s).runEntry(std::move(p), 256);
+    CHECK(r.kind == RunResult::Kind::Completed && r.hasReturnValue && r.returnValue.known
+          && static_cast<i32>(r.returnValue.asU32()) == 7);
+}
+
+// ── 10. LDC 字符串面：读密文（MUTF-8 原样）+ setLdcString 明文改写回读 ─────
 
 void testLdcStringSurface() {
     const ca::usize idx = g_session->unit().findMethod("lambda$lambdaSite$0", "()V");
@@ -561,6 +582,7 @@ int main(int argc, char** argv) {
     testInvokeFamily();
     testCtor();
     testMultiArray();
+    testObjArrayLength();
     testLdcStringSurface();
     testRejects();
 

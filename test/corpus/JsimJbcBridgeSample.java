@@ -86,6 +86,15 @@ public class JsimJbcBridgeSample {
         return g.length;
     }
 
+    /// anewarray 对象分量（桥描述符形回归）：CP 类常量是内部名分量
+    ///（java/lang/String），桥须装成描述符形入 allocTypes，否则 engine 堆
+    /// className 形如 "[java/lang/String"，isRefArray 不识别 → arraylength
+    /// 读原始载荷恒 0。
+    public static int objArrayDim(int a) {
+        Object[] arr = new String[a];
+        return arr.length;
+    }
+
     /// 实例面：ctor 走 invokespecial（Object.<init> + putfield），heldTwice 走
     /// getfield + invokevirtual(String.length)，throughProbe 走 invokeinterface。
     private final int held;

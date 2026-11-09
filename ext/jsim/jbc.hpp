@@ -297,12 +297,24 @@ inline Result<Method, BridgeError> toSimMethod(jbc::ir::ClassSession& s,
             out.fields.push_back(std::move(field));
             break;
         }
-        case jbc::core::Op::NEW:
-        case jbc::core::Op::ANEWARRAY: {
+        case jbc::core::Op::NEW: {
             std::string_view cls = s.classOf(*in);
             if (cls.empty()) return fail(BridgeError::Stage::BadClass, "类常量解析失败");
             ji.a = static_cast<i32>(out.allocTypes.size());
             out.allocTypes.emplace_back(cls);
+            break;
+        }
+        case jbc::core::Op::ANEWARRAY: {
+            // ANEWARRAY 的 CP 类常量是**分量**类型：对象分量为内部名
+            //（java/lang/String），数组分量已是描述符形（[Ljava/lang/String;）。
+            // engine 堆侧 className 约定描述符形（MULTIANEWARRAY 路径同款：
+            // N×'[' + 描述符 elemType）——对象分量在此装 L…;，否则 isRefArray
+            // 不识别 → arraylength 恒 0 → 界检探针走错分支。
+            std::string_view cls = s.classOf(*in);
+            if (cls.empty()) return fail(BridgeError::Stage::BadClass, "类常量解析失败");
+            ji.a = static_cast<i32>(out.allocTypes.size());
+            out.allocTypes.emplace_back(cls[0] == '[' ? std::string(cls)
+                                                      : "L" + std::string(cls) + ";");
             break;
         }
         case jbc::core::Op::MULTIANEWARRAY: {
