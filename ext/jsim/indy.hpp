@@ -1,4 +1,5 @@
 /// @file indy.hpp
+/// @defgroup indy jsim-indy invokedynamic 脚手架
 /// @brief jsim-indy 扩展包：MethodType / MethodHandle / Lookup / CallSite 的最小建模。
 ///
 /// 目的只有一个：**让 bootstrap 方法能跑到底，把「调用点到底指向谁」算出来**。

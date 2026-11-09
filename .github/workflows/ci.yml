@@ -1,0 +1,137 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  docs:
+    name: docs (引用门禁 + Sphinx + Doxygen)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Sphinx
+        # 钉死本地实测通过的版本：-W 下警告集合随 Sphinx 小版本变，范围安装等于定时炸；升级随文档批次显式改这一行。
+        run: python -m pip install --upgrade "sphinx==9.1.1"
+
+      - name: Reference gate (check_refs)
+        run: python doc/check_refs.py .
+
+      # -E：增量缓存会跳过「回到旧状态」的文件，警告随之消失，等于没门禁。
+      - name: "Build design docs (-W: 警告即失败)"
+        run: sphinx-build -b html -E -W --keep-going doc doc/_build
+
+      - name: Upload site
+        uses: actions/upload-artifact@v4
+        with:
+          name: libjsim-doc-html
+          path: doc/_build
+          retention-days: 14
+
+      # 微观层：Doxygen 只吃头文件 /// 注释，与 RST 站互不干涉。
+      # 版本必须钉死（与本地实测同版）：Doxyfile 的 WARN_* 档随版本增减标签，
+      # 老版本会把「不认识的标签」报成告警，WARN_AS_ERROR 下直接变红。
+      - name: Install Doxygen (pinned 1.18.0)
+        run: |
+          curl -fsSL https://www.doxygen.nl/files/doxygen-1.18.0.linux.bin.tar.gz -o /tmp/dox.tar.gz
+          mkdir -p "$HOME/doxygen"
+          tar xzf /tmp/dox.tar.gz -C "$HOME/doxygen" --strip-components=1
+          test -x "$HOME/doxygen/bin/doxygen"
+          echo "$HOME/doxygen/bin" >> "$GITHUB_PATH"
+
+      # GITHUB_PATH 的追加不回灌当前步，PATH 自本步起生效；版本打印放这里。
+      - name: Build API docs (WARN_AS_ERROR)
+        run: |
+          doxygen --version
+          doxygen doc/Doxyfile
+
+      - name: Upload API site
+        uses: actions/upload-artifact@v4
+        with:
+          name: libjsim-doc-apidoc
+          path: doc/_apidoc/html
+          retention-days: 14
+
+  test:
+    name: test (windows)
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: 3.0.9
+          package-cache: true
+
+      # jsim-demo-deobf 运行时经 libjdk_finder 定位 JDK 现场编译样本。
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: configure
+        run: xmake f -y
+
+      - name: build
+        run: xmake build -y
+
+      - name: unit tests
+        run: |
+          xmake run jsim-test
+          xmake run jsim-jbc-test
+          xmake run jsim-jni-test
+
+      - name: demos
+        run: |
+          xmake run jsim-demo
+          xmake run jsim-demo-deobf
+          xmake run jsim-demo-jni
+
+  e2e:
+    name: e2e (jni sample + HotSpot 对拍)
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: 3.0.9
+          package-cache: true
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # 样本 jar 是构建产物：javac --release 8 三件套 + cl/link 自包含 DLL。
+      # 脚本自己经 vswhere 找 VS 并在子 cmd 里调 vcvars64，无需 dev prompt。
+      - name: Regenerate jni sample jar
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File test/jni/sample/build-sample.ps1
+
+      - name: configure
+        run: xmake f -y
+
+      - name: build
+        run: xmake build -y jsim-jni-e2e-test
+
+      # jar 在场走全量 13 项；JDK 在场另跑真 JVM (HotSpot) 对拍腿。
+      - name: e2e test
+        run: xmake run jsim-jni-e2e-test

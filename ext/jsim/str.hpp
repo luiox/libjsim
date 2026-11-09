@@ -1,6 +1,7 @@
 /// @file str.hpp
+/// @defgroup str jsim-str 字符串语义包
 /// @brief jsim-str 扩展包：String 家族与 StringBuilder 的调用接管、分配脚手架。
-///        扩展包与用户代码走同一注册面，核心零依赖本文件（设计 §7/D10）。
+///        扩展包与用户代码走同一注册面，核心零依赖本文件（doc:design-packages/D10）。
 
 #pragma once
 
@@ -145,11 +146,11 @@ inline void install(Session& session) {
     };
 }
 
-/// 字符串构造两阶段（§7 jsim-str 职责面）：
+/// 字符串构造两阶段（doc:design-packages jsim-str 职责面）：
 ///   1. new java/lang/String 走分配脚手架（空 data 载荷，形态未初始化）；
-///   2. <init>([C)V 把 char[] 码元逐个 appendCodeUnit 写进接收者 data——
+///   2. \<init>([C)V 把 char[] 码元逐个 appendCodeUnit 写进接收者 data——
 ///      构造完成前的对象只是脚手架壳，语义在第二阶段落位。
-/// <init> 的 CallRef.hasReturn=false（引擎不压返回值），初始化完的接收者
+/// \<init> 的 CallRef.hasReturn=false（引擎不压返回值），初始化完的接收者
 /// 留在栈顶。形态不符（非 (String, char[]) 或载荷缺失）明确 Bail，不编造。
 inline void installStringAlloc(Session& session) {
     session.allocScaffolds["java/lang/String"] = [] { return std::string(); };

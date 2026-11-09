@@ -206,16 +206,17 @@ bool compileSample(const fs::path& javac, const fs::path& src, const fs::path& o
     return true;
 }
 
-/// 定位合成样本源码：CWD 相对优先（xmake run 在仓根），再按可执行文件位置
-/// 回溯（build/<plat>/<arch>/<mode> 上溯三级）。
+/// 定位合成样本源码：CWD 相对优先，再按可执行文件位置逐级上溯——与
+/// jsim-jbc-test / jsim-jni-e2e-test 同款（build/<plat>/<arch>/<mode> 四层）。
 fs::path locateSampleSource(const char* argv0) {
     const fs::path relative = "demo/deobf/java/JsimObfSample.java";
     std::error_code ec;
     if (fs::exists(relative)) return relative;
-    const fs::path exeDir = fs::weakly_canonical(fs::path(argv0), ec).parent_path();
-    for (const fs::path& up : {exeDir / ".." / ".." / "..", exeDir / ".." / ".."}) {
-        const fs::path candidate = up / relative;
+    fs::path dir = fs::weakly_canonical(fs::path(argv0), ec).parent_path();
+    for (int up = 0; up < 6 && !dir.empty(); ++up) {
+        const fs::path candidate = dir / relative;
         if (fs::exists(candidate)) return candidate;
+        dir = dir.parent_path();
     }
     return {};
 }

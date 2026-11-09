@@ -1,10 +1,11 @@
 /// @file jbc.hpp
+/// @defgroup jbc jsim-jbc 模型搬运桥
 /// @brief jsim-jbc 扩展包：libjbc 字节码模型 ↔ libjsim 模拟执行的官方桥。
 ///        jbc dom/instruction 面 → jsim 执行输入（Method）的形状搬运、
 ///        字符串/LDC 面读写（setString 自动升格口径）、消费方最小接管点。
 ///
 /// 依赖声明：本包依赖外部包 libjbc（jbc/ir 会话面 + core Op），是扩展包
-/// 位面的边界胶水（设计 §7）；核心（src/jsim）零依赖红线不动，核心对本包
+/// 位面的边界胶水（doc:design-packages）；核心（src/jsim）零依赖红线不动，核心对本包
 /// 零反向依赖。与 jsim-str 等 JDK 语义包互不依赖，组合发生在用户侧。
 ///
 /// 字符串口径：classfile 常量是 MUTF-8 字节。桥按家族口径**原样透传**给
@@ -14,7 +15,7 @@
 /// if_acmpeq 的相等语义依赖它）。
 ///
 /// 消费方最小接管点：桥只做模型搬运，不注册任何语义。桥出来的 Method 配
-/// 普通 jsim::Session 跑，缺的语义照 §6 接管面补——
+/// 普通 jsim::Session 跑，缺的语义照 doc:design-takeover 接管面补——
 ///   - callMocks / callMocksAtPc：invoke 系（含解密器编排的跨方法接力）；
 ///   - allocScaffolds：new 系（String 构造两阶段走 jsim-str 的
 ///     str::installStringAlloc）；
@@ -58,7 +59,7 @@ struct BridgeError {
     std::string detail;
 };
 
-/// 描述符返回段 → ValType；`V` 置 hasReturn=false（<init> 等 void 调用）。
+/// 描述符返回段 → ValType；`V` 置 hasReturn=false（\<init> 等 void 调用）。
 inline bool retTypeOfDesc(std::string_view desc, ValType& out, bool& hasReturn) {
     hasReturn = true;
     const usize close = desc.find(')');
@@ -396,10 +397,10 @@ inline Result<Method, BridgeError> toSimMethod(jbc::ir::ClassSession& s,
             break;
         }
         case jbc::core::Op::INVOKEDYNAMIC:
-            // indy 的 bootstrap 语义属 jsim-indy 组合域（设计 §7），桥不猜。
+            // indy 的 bootstrap 语义属 jsim-indy 组合域（doc:design-packages），桥不猜。
             return fail(BridgeError::Stage::UnsupportedOp, "invokedynamic 未桥接（jsim-indy 组合域）");
         case jbc::core::Op::ATHROW:
-            // 异常表派发 v1 不做（设计 §11）。
+            // 异常表派发 v1 不做（doc:design-v1-scope）。
             return fail(BridgeError::Stage::UnsupportedOp, "athrow 需异常表派发（v1 不做）");
         case jbc::core::Op::JSR:
         case jbc::core::Op::JSR_W:

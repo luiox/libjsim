@@ -1,5 +1,5 @@
 /// @file test/jni/e2e/main.cpp
-/// @brief jsim-jni 端到端测试(真 jar + 真 DLL,docs/ext-jni.md 测试节):
+/// @brief jsim-jni 端到端测试(真 jar + 真 DLL,doc:ext-jni 测试节):
 ///        libjzip 打开 test/corpus/jni/jni-sample.jar → 取出 native DLL 与
 ///        Caller.class → PE 装载(按首选基址映射 + 导出表定位入口)→
 ///        jsim-jbc 桥出调用方字节码 → jsim 执行 → invoke native → unicorn

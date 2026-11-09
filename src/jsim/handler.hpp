@@ -1,5 +1,6 @@
 /// @file handler.hpp
-/// @brief 栈效应表与指令分类——默认 handler 只保证类型传播（设计 §4）。
+/// @defgroup handler 栈效应表与指令分类
+/// @brief 栈效应表与指令分类——默认 handler 只保证类型传播（doc:design-typeprop）。
 
 #pragma once
 

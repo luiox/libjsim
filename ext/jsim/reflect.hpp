@@ -1,4 +1,5 @@
 /// @file reflect.hpp
+/// @defgroup reflect jsim-reflect 反射语义包
 /// @brief jsim-reflect 扩展包：Class.forName / getAnnotation / 注解元素访问器。
 ///
 /// 反射是「方法名就是数据」的调用面：`invokeinterface Booger.d1()` 的语义不在

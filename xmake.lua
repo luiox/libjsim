@@ -23,11 +23,17 @@ local unicorn_dir = get_config("unicorn_dir")
 if unicorn_dir == nil then unicorn_dir = "" end
 
 -- 官方 xmake-repo 依赖只在走网络路径时装载;--unicorn_dir 旁路时完全不触网。
+-- archs 裁到 x86:本仓 unicorn 消费面只有 x86-64(jni_uc Win64/SysV 编组、
+-- e2e 手写 x64 机器码),aarch64 纯死重;不开它还规避一个 Windows 链接坑——
+-- unicorn 把 qemu/util/crc32c.c 无条件编进静态库(导出 crc32c 与裸 crc32),
+-- 其 aarch64 CRC 助手引用这组符号,把该 obj 拉进链接闭包,与 libjzip 传递
+-- 依赖 zlib 的 crc32 撞名(LNK2005/LNK1169);x86 的 CRC32 助手自带位循环,
+-- 不引用这组符号,该 obj 保持惰性不进闭包。
 if unicorn_dir == "" then
-    add_requires("unicorn 2.1.4")
+    add_requires("unicorn 2.1.4", { configs = { archs = { "x86" } } })
 end
 
--- 核心零外部依赖（设计 §9）；扩展包逐包独立 target，按需依赖（设计 §7）。
+-- 核心零外部依赖（doc:design-testing）；扩展包逐包独立 target，按需依赖（doc:design-packages）。
 target("jsim")
     set_kind("headeronly")
     add_headerfiles("src/jsim/*.hpp")
@@ -57,7 +63,7 @@ target("jsim-indy")
     add_includedirs("ext", { public = true })
     add_deps("jsim")
 
--- jsim-jbc 桥扩展包（设计 §7/§9）：libjbc 字节码模型 ↔ jsim 模拟执行的
+-- jsim-jbc 桥扩展包（doc:design-packages/design-testing）：libjbc 字节码模型 ↔ jsim 模拟执行的
 -- 官方桥——CodeUnit → jsim::Method 形状搬运、LDC 字符串面（setString 自动
 -- 升格口径）、消费方最小接管点。唯一带 libjbc 依赖的扩展包位面；核心
 -- 零依赖红线不动（核心对本包零反向依赖）。
@@ -68,7 +74,7 @@ target("jsim-jbc")
     add_deps("jsim")
     add_packages("libjbc", { public = true })
 
--- jsim-jni 本地方法扩展包(docs/ext-jni.md):纯层——JNI 函数表(JDK 8 布局)、
+-- jsim-jni 本地方法扩展包(doc:ext-jni):纯层——JNI 函数表(JDK 8 布局)、
 -- 钩子分发、句柄池、编组、默认骨架、install 接缝。零外部依赖,测试走 FakeMachine。
 target("jsim-jni")
     set_kind("headeronly")
@@ -124,7 +130,7 @@ target("jsim-test")
 
 -- jsim-jbc 桥接测试（独立 target：与零依赖的 jsim-test 分开，语料与依赖
 -- 只挂本面）：合成 class 语料（test/corpus，javac --release 8 产物 v52）
--- → libjbc → 桥 → jsim 执行，期望值同算法独立复算（设计 §9）。
+-- → libjbc → 桥 → jsim 执行，期望值同算法独立复算（doc:design-testing）。
 target("jsim-jbc-test")
     set_kind("binary")
     add_files("test/jbc/main.cpp")
@@ -134,7 +140,7 @@ target("jsim-jbc-test")
     end
 
 -- jsim-jni 纯层测试(FakeMachine 驱动,零 unicorn 依赖):骨架逐条、句柄池
--- 生命周期、异常位、编组对拍、钩子覆盖优先级(docs/ext-jni.md 测试节)。
+-- 生命周期、异常位、编组对拍、钩子覆盖优先级(doc:ext-jni 测试节)。
 target("jsim-jni-test")
     set_kind("binary")
     add_files("test/jni/main.cpp")
