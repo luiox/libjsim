@@ -240,6 +240,16 @@ struct LookupTable {
     u32 defaultPc = 0;
 };
 
+/// 异常表条目（athrow 派发的查表输入）。语义对齐 JVMS 4.7.3：pc 落在
+/// [startPc, endPc) 内抛出时跳 handlerPc，进入处理器前栈清空、压异常对象
+/// 引用。catchType 为空 = any（catch-all / finally），匹配任意异常。
+struct ExRange {
+    u32 startPc = 0;   ///< 保护区起点（含），pc 下标
+    u32 endPc = 0;     ///< 保护区终点（不含）；保护区到方法末尾时 = code.size()
+    u32 handlerPc = 0; ///< 处理器入口 pc
+    std::string catchType; ///< 捕获类型内部名；空 = any
+};
+
 struct Insn {
     u8 opcode = 0;
     i32 a = 0; // 槽号 / cp 下标 / calls 下标 / 跳转目标 / switchTables/lookupTables 下标 / allocTypes 下标
@@ -257,6 +267,7 @@ struct Method {
     std::vector<std::string> allocTypes;
     std::vector<SwitchTable> switchTables;
     std::vector<LookupTable> lookupTables;
+    std::vector<ExRange> handlers; ///< 异常表（athrow 派发查这里，表序即 JVM 派发序）
     u32 maxLocals = 0;
 };
 
@@ -264,7 +275,7 @@ struct Method {
 class MethodBuilder {
 public:
     MethodBuilder(std::string name, std::string desc, u32 maxLocals)
-        : method_{std::move(name), std::move(desc), {}, {}, {}, {}, {}, {}, {}, maxLocals} {}
+        : method_{std::move(name), std::move(desc), {}, {}, {}, {}, {}, {}, {}, {}, maxLocals} {}
 
     MethodBuilder& raw(u8 opcode, i32 a = 0, i32 b = 0) {
         method_.code.push_back({opcode, a, b});

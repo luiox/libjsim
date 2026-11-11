@@ -37,7 +37,9 @@ API 面
 
 桥接覆盖面：常量/装载存储/算术/转换/栈操作/iinc/monitor（a/b 原样）、ldc 全家桶（int/long/float/double/String/Class）、四类 invoke（CallRef 带 owner/name/desc/retType/hasReturn/**isStatic**）、字段四形（FieldRef）、new/newarray/anewarray/multianewarray、分支 19 形（标签折 pc）、tableswitch/lookupswitch、checkcast/instanceof（jsim 默认语义）。
 
-明确拒绝（\ ``BridgeError::UnsupportedOp``\ ）：invokedynamic（jsim-indy 组合域）、athrow（异常表派发 v1 不做）、jsr/jsr_w/ret（子例程模型不进 jsim）。
+invokedynamic 的调用点正路径（CallRef 承 NAT name + 调用点描述符，owner 空、isStatic=true；bootstrap 链不搬，「指向谁」归 jsim-indy 组合域或消费方接管面）；athrow + 异常表（\ ``cu->exc``\ 边界折 pc 落 \ ``Method.handlers``\ ，catchCp 经 resolveClassName 落内部名，0 = any，表序即派发序）。
+
+明确拒绝（\ ``BridgeError::UnsupportedOp``\ ）：jsr/jsr_w/ret（子例程模型不进 jsim）。
 
 .. _ext-jbc-consumer:
 

@@ -810,6 +810,61 @@ void testIndyPackage() {
           t.desc == "()V");
 }
 
+// ── athrow 异常表派发：catch-all 恒派发；具名 catch 只认类名精确相等 ────────
+
+void testThrowDispatch() {
+    // catch-all（catchType 空）：Unknown 异常对象也派发——任意异常都进
+    // finally 形，这在无类层次面下也是确定的。handler 入口栈 = 异常引用。
+    Method any = MethodBuilder("t", "(I)V", 2)
+                     .raw(op::AThrow) // 0：栈顶异常引用直接抛
+                     .vreturn()       // 1：handler 入口
+                     .build();
+    any.handlers.push_back({0, 1, 1, ""});
+    Session s;
+    Prefill unk;
+    unk.stack = {SimValue::unknownOf(ValType::Ref)};
+    RunResult r = runIt(any, s, std::move(unk));
+    CHECK(r.kind == RunResult::Kind::Completed);
+    CHECK(r.finalStack.size() == 1 && r.finalStack.front().type == ValType::Ref);
+
+    // 具名 catch + 已知堆对象：类名与 catchType 精确相等才派发。
+    Method named = MethodBuilder("t2", "(I)V", 2)
+                       .raw(op::AThrow) // 0
+                       .vreturn()       // 1：handler 入口
+                       .build();
+    named.handlers.push_back({0, 1, 1, "demo/Err"});
+    Session s2;
+    const u64 id = s2.nextAllocId++;
+    HeapObj err;
+    err.className = "demo/Err";
+    s2.heap[id] = std::move(err);
+    Prefill hit;
+    hit.stack = {SimValue::knownObj(id)};
+    RunResult r2 = runIt(named, s2, std::move(hit));
+    CHECK(r2.kind == RunResult::Kind::Completed);
+
+    // 类名不可确证（null 引用无类名；类名对不上亦然——无层次面无法区分
+    // 子类/无关）→ fail-closed Bail{NotConcrete}。
+    Prefill miss;
+    miss.stack = {SimValue::knownNull()};
+    RunResult r3 = runIt(named, s2, std::move(miss));
+    CHECK(r3.kind == RunResult::Kind::Bailed &&
+          r3.bail.reason == Bail::Reason::NotConcrete);
+
+    // 无覆盖处理器（athrow 所在 pc 落在保护区外）→ Bail{NotConcrete}。
+    Method naked = MethodBuilder("t3", "(I)V", 2)
+                       .raw(op::AThrow) // 0
+                       .vreturn()       // 1
+                       .build();
+    naked.handlers.push_back({1, 2, 1, ""}); // 保护区 [1,2) 不含 pc 0
+    Session s4;
+    Prefill out;
+    out.stack = {SimValue::knownNull()};
+    RunResult r4 = runIt(naked, s4, std::move(out));
+    CHECK(r4.kind == RunResult::Kind::Bailed &&
+          r4.bail.reason == Bail::Reason::NotConcrete);
+}
+
 } // namespace
 
 int main() {
@@ -826,6 +881,7 @@ int main() {
     testNumPackage();
     testReflectPackage();
     testIndyPackage();
+    testThrowDispatch();
     std::printf("[jsim-test] %d 项断言，%d 失败\n", g_total, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

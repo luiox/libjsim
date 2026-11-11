@@ -529,20 +529,78 @@ void testLdcStringSurface() {
     }
 }
 
-// ── 10. 失败面：invokedynamic 整方法拒绝，不产半截方法 ─────────────────────
+// ── 10. invokedynamic：调用点桥接为 CallRef（无 owner），语义走接管面 ──────
 
-void testRejects() {
-    const ca::usize idx = g_session->unit().findMethod("lambdaSite", "()Ljava/lang/Runnable;");
-    CHECK(idx != jbc::ir::kNoMethod);
-    if (idx == jbc::ir::kNoMethod) return;
-    auto bridged = jbcbridge::toSimMethod(*g_session, idx);
-    CHECK(!bridged.isOk());
-    if (!bridged.isOk()) {
-        CHECK(bridged.error().stage == BridgeError::Stage::UnsupportedOp);
-        CHECK(bridged.error().detail.find("invokedynamic") != std::string::npos);
-        std::printf("  lambdaSite 拒绝（预期）：%s: %s\n",
-                    stageName(bridged.error().stage), bridged.error().detail.c_str());
+void testIndyBridge() {
+    Method m = bridgeMethod("lambdaSite", "()Ljava/lang/Runnable;");
+    CHECK(m.code.size() >= 2); // invokedynamic + areturn
+    CHECK(m.calls.size() == 1);
+    if (m.calls.size() == 1) {
+        const CallRef& call = m.calls.front();
+        // indy 无 owner：NAT name + 调用点描述符原样落 CallRef，栈面全是实参。
+        CHECK(call.owner.empty());
+        CHECK(call.name == "run");
+        CHECK(call.desc == "()Ljava/lang/Runnable;");
+        CHECK(call.isStatic && call.hasReturn && call.retType == ValType::Ref);
     }
+
+    // 执行面：indy 无签名键可用（owner 空），pc 注册是惯用法。mock 弹零参、
+    // 压已知 null——lambdaSite 完成且回 null。
+    const i32 indyAt = findInsn(m, [](const Insn& in, const Method&) {
+        return in.opcode == op::InvokeDynamic;
+    });
+    CHECK(indyAt >= 0);
+    if (indyAt >= 0) {
+        Session s = makeSession();
+        s.callMocksAtPc[static_cast<u32>(indyAt)] = [](Frame&) {
+            return Result<SimValue, Bail>::ok(SimValue::knownNull());
+        };
+        RunResult r = Sim(m, s).runEntry(Prefill{}, 256);
+        CHECK(r.kind == RunResult::Kind::Completed && r.hasReturnValue
+              && r.returnValue.known && r.returnValue.ref.kind == RefPayload::Kind::Null);
+    }
+}
+
+// ── 11. athrow + 异常表：抛出即捕获的派发（表序即 JVM 派发序） ─────────────
+
+void testThrowCatch() {
+    Method m = bridgeMethod("throwCatch", "(I)I");
+    CHECK(m.handlers.size() == 1);
+    if (m.handlers.size() == 1) {
+        const ExRange& ex = m.handlers.front();
+        CHECK(ex.catchType == "java/lang/IllegalStateException");
+        CHECK(ex.startPc < ex.endPc && ex.endPc <= m.code.size());
+        CHECK(ex.handlerPc < m.code.size());
+    }
+
+    // 负路径：new + athrow → 异常表派发进 catch → 哨兵 -7。构造器接管弹
+    // receiver + 实参；分配脚手架给出空载荷 HeapObj——引擎按堆对象类名对上
+    // catchType 才派发（fail-closed 口径：类名对不上一律 Bail）。
+    Session s = makeSession();
+    s.allocScaffolds["java/lang/IllegalStateException"] = [] { return std::string(); };
+    s.callMocks["java/lang/IllegalStateException.<init>(Ljava/lang/String;)V"] =
+        [](Frame& frame) -> Result<SimValue, Bail> {
+        Result<SimValue, Bail> msg = frame.popChecked();
+        if (!msg.isOk()) return Result<SimValue, Bail>::err(msg.error());
+        Result<SimValue, Bail> recv = frame.popChecked();
+        if (!recv.isOk()) return Result<SimValue, Bail>::err(recv.error());
+        return Result<SimValue, Bail>::ok(recv.value());
+    };
+    Prefill neg;
+    neg.locals = {SimValue::knownI32(-1)};
+    RunResult r = Sim(m, s).runEntry(std::move(neg), 256);
+    CHECK(r.kind == RunResult::Kind::Completed && r.hasReturnValue
+          && r.returnValue.known && r.returnValue.type == ValType::I32
+          && static_cast<i32>(r.returnValue.asU32()) == -7);
+
+    // 正路径不触发 athrow：k=5 → 6（异常表在但不派发）。
+    Session s2 = makeSession();
+    Prefill pos;
+    pos.locals = {SimValue::knownI32(5)};
+    RunResult r2 = Sim(m, s2).runEntry(std::move(pos), 256);
+    CHECK(r2.kind == RunResult::Kind::Completed && r2.hasReturnValue
+          && r2.returnValue.known && r2.returnValue.type == ValType::I32
+          && static_cast<i32>(r2.returnValue.asU32()) == 6);
 }
 
 } // namespace
@@ -584,7 +642,8 @@ int main(int argc, char** argv) {
     testMultiArray();
     testObjArrayLength();
     testLdcStringSurface();
-    testRejects();
+    testIndyBridge();
+    testThrowCatch();
 
     std::printf("jsim-jbc 桥接测试：%d/%d 通过\n", g_total - g_fail, g_total);
     if (g_fail != 0) std::printf("存在失败断言\n");
