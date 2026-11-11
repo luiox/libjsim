@@ -17,12 +17,15 @@
 /// 消费方最小接管点：桥只做模型搬运，不注册任何语义。桥出来的 Method 配
 /// 普通 jsim::Session 跑，缺的语义照 doc:design-takeover 接管面补——
 ///   - callMocks / callMocksAtPc：invoke 系（含解密器编排的跨方法接力）；
+///     indy 与 invoke 同管道，CallRef 无 owner，按调用点 pc 注册是惯用法；
 ///   - allocScaffolds：new 系（String 构造两阶段走 jsim-str 的
 ///     str::installStringAlloc）；
 ///   - opcodeHandlers：表外 opcode 或默认语义不够时的整条接管；
 ///   - fieldMocks / branchHooks / callMockResolver：字段注入、分支三态裁决、
 ///     按接收者解析。
-/// 三个注册表始终对消费方开放（透出），桥不包裹、不隐藏。
+/// athrow 例外：异常表派发是引擎内建（catch-all/类名精确可确证时跳处理器，
+/// 不可确证时 Bail），不需接管。三个注册表始终对消费方开放（透出），桥不
+/// 包裹、不隐藏。
 
 #pragma once
 
@@ -31,6 +34,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "jbc/core/cp_resolve.hpp"
 #include "jbc/core/opcode.hpp"
 #include "jbc/ir/code_dom.hpp"
 #include "jbc/ir/units.hpp"
@@ -52,7 +56,7 @@ struct BridgeError {
         BadMemberRef,   ///< invoke / 字段引用解析失败（CP 结构不符）
         BadDesc,        ///< 方法或字段描述符不可解析
         BadClass,       ///< new 族类常量解析失败
-        UnsupportedOp,  ///< v1 明确不桥的指令族（invokedynamic / athrow / jsr / ret）
+        UnsupportedOp,  ///< v1 明确不桥的指令族（jsr / ret 子例程）
     };
 
     Stage stage = Stage::BadDom;
@@ -297,12 +301,24 @@ inline Result<Method, BridgeError> toSimMethod(jbc::ir::ClassSession& s,
             out.fields.push_back(std::move(field));
             break;
         }
-        case jbc::core::Op::NEW:
-        case jbc::core::Op::ANEWARRAY: {
+        case jbc::core::Op::NEW: {
             std::string_view cls = s.classOf(*in);
             if (cls.empty()) return fail(BridgeError::Stage::BadClass, "类常量解析失败");
             ji.a = static_cast<i32>(out.allocTypes.size());
             out.allocTypes.emplace_back(cls);
+            break;
+        }
+        case jbc::core::Op::ANEWARRAY: {
+            // ANEWARRAY 的 CP 类常量是**分量**类型：对象分量为内部名
+            //（java/lang/String），数组分量已是描述符形（[Ljava/lang/String;）。
+            // engine 堆侧 className 约定描述符形（MULTIANEWARRAY 路径同款：
+            // N×'[' + 描述符 elemType）——对象分量在此装 L…;，否则 isRefArray
+            // 不识别 → arraylength 恒 0 → 界检探针走错分支。
+            std::string_view cls = s.classOf(*in);
+            if (cls.empty()) return fail(BridgeError::Stage::BadClass, "类常量解析失败");
+            ji.a = static_cast<i32>(out.allocTypes.size());
+            out.allocTypes.emplace_back(cls[0] == '[' ? std::string(cls)
+                                                      : "L" + std::string(cls) + ";");
             break;
         }
         case jbc::core::Op::MULTIANEWARRAY: {
@@ -396,12 +412,34 @@ inline Result<Method, BridgeError> toSimMethod(jbc::ir::ClassSession& s,
             out.lookupTables.push_back(std::move(table));
             break;
         }
-        case jbc::core::Op::INVOKEDYNAMIC:
-            // indy 的 bootstrap 语义属 jsim-indy 组合域（doc:design-packages），桥不猜。
-            return fail(BridgeError::Stage::UnsupportedOp, "invokedynamic 未桥接（jsim-indy 组合域）");
+        case jbc::core::Op::INVOKEDYNAMIC: {
+            // indy 桥接为普通调用点：CallRef 承 NAT name + 调用点描述符（无
+            // owner，indy 栈面没有接收者，全是实参）。bootstrap 链不搬——
+            // 「调用点指向谁」属 jsim-indy 组合域（indy.hpp 跑 BSM 折叠）或
+            // 消费方接管面（callMocksAtPc 按调用点注册）；桥只保证方法载得
+            // 进来、调用点可寻址，语义缺接管时引擎照旧 Bail（fail-closed）。
+            jbc::ir::ClassSession::MemberSem mem;
+            if (!s.memberOf(*in, mem)
+                || mem.kind != jbc::ir::ClassSession::MemberSem::Kind::InvokeDynamic) {
+                return fail(BridgeError::Stage::BadMemberRef, "indy 调用点解析失败");
+            }
+            CallRef call;
+            call.name = std::string(mem.name);
+            call.desc = std::string(mem.desc);
+            bool indyHasRet = true;
+            if (!retTypeOfDesc(call.desc, call.retType, indyHasRet)) {
+                return fail(BridgeError::Stage::BadDesc, "indy 描述符不可解析");
+            }
+            call.hasReturn = indyHasRet;
+            call.isStatic = true;
+            ji.a = static_cast<i32>(out.calls.size());
+            out.calls.push_back(std::move(call));
+            break;
+        }
         case jbc::core::Op::ATHROW:
-            // 异常表派发 v1 不做（doc:design-v1-scope）。
-            return fail(BridgeError::Stage::UnsupportedOp, "athrow 需异常表派发（v1 不做）");
+            // athrow 无操作数；异常表（cu->exc）在指令循环后统一搬运成
+            // Method.handlers，派发语义在引擎（engine AThrow case）。
+            break;
         case jbc::core::Op::JSR:
         case jbc::core::Op::JSR_W:
         case jbc::core::Op::RET:
@@ -415,6 +453,28 @@ inline Result<Method, BridgeError> toSimMethod(jbc::ir::ClassSession& s,
         }
 
         out.code.push_back(ji);
+    }
+
+    // 异常表搬运：LabelId 边界折成 pc（end 绑方法末尾标签时折成 code.size()，
+    // 与 JVMS end_pc == code_length 同表达）；catchCp 是 CP Class 索引，
+    // 0 = any（catch-all / finally），非 0 经 core::resolveClassName 落内部名。
+    // 表序即 JVM 派发序（JVMS 4.10.4：第一个匹配的表项胜出），原样保留。
+    out.handlers.reserve(cu->exc.size());
+    for (const jbc::ir::CodeUnit::Exc& ex : cu->exc) {
+        ExRange range;
+        if (!resolveLabelPc(ex.start, range.startPc)
+            || !resolveLabelPc(ex.end, range.endPc)
+            || !resolveLabelPc(ex.handler, range.handlerPc)) {
+            return fail(BridgeError::Stage::BadLabel, "异常表边界解析失败");
+        }
+        if (ex.catchCp != 0) {
+            std::string_view cls = jbc::core::resolveClassName(s.backing().cp, ex.catchCp);
+            if (cls.empty()) {
+                return fail(BridgeError::Stage::BadClass, "异常表 catch 类型解析失败");
+            }
+            range.catchType = std::string(cls);
+        }
+        out.handlers.push_back(std::move(range));
     }
     return Result<Method, BridgeError>::ok(std::move(out));
 }

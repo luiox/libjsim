@@ -80,7 +80,7 @@ API 面（纯层）
 
 **Call\*Method 家族**：jmethodID 载荷带 (owner, name, desc)。默认 handler 把实参按 desc 解开，交 \ ``JniEnv::javaInvoker``\ 回跳——消费方在那里开嵌套 jsim::Sim 跑被调方法（核心 D9 不破：核心仍单方法，编排属消费方）；javaInvoker 未设则 Bail{UnsupportedCall}。A 变体读 guest 内存 jvalue 数组；V 变体 Win64 按 char\* 直读、SysV 的 va_list 结构 v1 不做；裸变体按 ABI 位置读寄存器与栈。异常回跳例外：被调方法若 Bail，上抛同口径。
 
-**异常面**：pendingThrow 位是 JniEnv 状态。ThrowNew / Throw 置位并返回 0；ExceptionCheck / ExceptionOccurred 反映它；置位后 dispatch 拒绝后续 JNI 调用（JNI 契约是钩子立即返回，这里做防御）。native 停机若 pendingThrow 仍在，CallMock 返回 Bail——与 athrow v1 不做同一条纪律：异常派发不进模型，宁可断链不静默走错。
+**异常面**：pendingThrow 位是 JniEnv 状态。ThrowNew / Throw 置位并返回 0；ExceptionCheck / ExceptionOccurred 反映它；置位后 dispatch 拒绝后续 JNI 调用（JNI 契约是钩子立即返回，这里做防御）。native 停机若 pendingThrow 仍在，CallMock 返回 Bail——与 athrow 派发的 fail-closed 口径同一条纪律：类型不可确证就断链，不静默走错。
 
 **观测与熔断**：\ ``env.trace``\ 每次 JNI 调用记一行（函数名、参数展示、返回值展示），与 jsim 观测面同责（只读）。native 侧步数上限 \ ``JniEnv::maxSteps``\ 由绑定层经 uc_emu_start 的步数参数消费，超限 Bail{NotConcrete}，防混淆器埋死循环。
 

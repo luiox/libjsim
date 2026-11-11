@@ -2,7 +2,7 @@
 /// ldc 全家桶（int/long/float/double/String/Class）、分支与回边、
 /// tableswitch/lookupswitch、四类 invoke、字段面（含 statics 接力）、
 /// new/newarray/anewarray/multianewarray、字符串构造两阶段、
-/// 以及桥必须明确拒绝的 invokedynamic（lambdaSite）。
+/// 以及 indy/athrow 的调用点与异常表正路径（lambdaSite / throwCatch）。
 ///
 /// 语料再生：javac --release 8 -encoding UTF-8 JsimJbcBridgeSample.java
 /// （class v52；产物 JsimJbcBridgeSample.class 检入本目录，测试读它，
@@ -86,6 +86,15 @@ public class JsimJbcBridgeSample {
         return g.length;
     }
 
+    /// anewarray 对象分量（桥描述符形回归）：CP 类常量是内部名分量
+    ///（java/lang/String），桥须装成描述符形入 allocTypes，否则 engine 堆
+    /// className 形如 "[java/lang/String"，isRefArray 不识别 → arraylength
+    /// 读原始载荷恒 0。
+    public static int objArrayDim(int a) {
+        Object[] arr = new String[a];
+        return arr.length;
+    }
+
     /// 实例面：ctor 走 invokespecial（Object.<init> + putfield），heldTwice 走
     /// getfield + invokevirtual(String.length)，throughProbe 走 invokeinterface。
     private final int held;
@@ -102,8 +111,22 @@ public class JsimJbcBridgeSample {
         return p.probe(x) + held;
     }
 
-    /// 桥的明确拒绝路径：lambda 编译为 invokedynamic（v1 不桥，jsim-indy 组合域）。
+    /// indy 调用点正路径：lambda 编译为 invokedynamic，桥把它搬成 CallRef
+    ///（无 owner 的 NAT 调用点），语义由消费方接管面（callMocksAtPc）决定。
     public static Runnable lambdaSite() {
         return () -> System.out.println("lambda");
+    }
+
+    /// athrow 派发正路径：抛出即捕获（ZKM 控制流同形）——try 内 new + athrow，
+    /// catch 接住返回哨兵；异常表经桥落 Method.handlers（表序即派发序）。
+    public static int throwCatch(int k) {
+        try {
+            if (k < 0) {
+                throw new IllegalStateException("neg");
+            }
+            return k + 1;
+        } catch (IllegalStateException e) {
+            return -7;
+        }
     }
 }

@@ -815,11 +815,38 @@ private:
             if (!popped.isOk()) return bailStep(popped.error());
             return StepResult{};
         }
-        // athrow 需要异常表派发，v1 明确不做（doc:design-v1-scope）：直接 Bail，不静默跳过。
+        // athrow 异常表派发。jsim 没有类层次面，派发只做**能静态确证**的匹配
+        //（fail-closed：猜错 = 假派发，比放弃更糟）——catch-all（catchType 空）
+        // 对任意异常恒成立；具名 catch 要求抛出对象的堆类名与 catchType 精确
+        // 相等。类名对不上（可能是子类/无关，无层次面无法区分）或抛出对象类型
+        // 未知时一律 Bail。表序即 JVM 派发序，首个可确证表项胜出。
         case op::AThrow: {
             Result<SimValue, Bail> popped = popChecked(pc);
             if (!popped.isOk()) return bailStep(popped.error());
-            return bailStep({Bail::Reason::NotConcrete, pc, "athrow 需异常表派发（v1 不做）"});
+            bool typeKnown = false;
+            std::string thrownClass;
+            if (popped.value().known && popped.value().ref.kind == RefPayload::Kind::Obj) {
+                auto it = session_->heap.find(popped.value().ref.objId);
+                if (it != session_->heap.end()) {
+                    typeKnown = true;
+                    thrownClass = it->second.className;
+                }
+            }
+            for (const ExRange& ex : method_->handlers) {
+                if (!(pc >= ex.startPc && pc < ex.endPc)) continue;
+                if (!ex.catchType.empty()) {
+                    if (!typeKnown || thrownClass != ex.catchType) {
+                        return bailStep({Bail::Reason::NotConcrete, pc,
+                                         "athrow 异常类型无法静态确证（无类层次面）"});
+                    }
+                }
+                stack_.clear(); // JVM 语义：进入处理器前栈清空，仅剩异常对象
+                StepResult handler = jumpStep(ex.handlerPc);
+                handler.pushResult = true;
+                handler.pushValue = popped.value();
+                return handler;
+            }
+            return bailStep({Bail::Reason::NotConcrete, pc, "athrow 无覆盖处理器"});
         }
         case op::Iinc: {
             SimValue v = localOrUnknown(insn.a, ValType::I32);
