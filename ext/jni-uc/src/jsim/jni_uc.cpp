@@ -1,48 +1,21 @@
-/// @file jni_uc.hpp
-/// @defgroup jni_uc jsim-jni unicorn 绑定层
-/// @brief jsim-jni 绑定层(doc:ext-jni):unicorn x86-64(Win64 + SysV)。
-///
-/// 职责只有三件,JNI 语义全在纯层(jni.hpp):
-/// 1. 物化:JNIEnv 函数表与 trap page 落进 guest 内存。表第 i 项指向 trap page
-///    内唯一地址,机器码调表即落 stub,UC_HOOK_CODE 截获后按地址差还原函数号。
-/// 2. ABI 编组:Win64 位置制(前四槽 = RCX/RDX/R8/R9 与 XMM0..3 同槽,溢出实参
-///    自第 5 槽落栈,先垫 0x20 影子空间);SysV 类计数制(整数 6 + 浮点 8 各自按
-///    序,耗尽后按落栈序占 8 字节槽);返回值按 FuncMeta::Ret 写 RAX 或 XMM0。
-///    bare Call*Method 这类变长入口按 Win64 变长约定浮点走整数文件。
-/// 3. 熔断与停机:uc_emu_start 步数上限(JniEnv::maxSteps)防死循环;guest 坏
-///    访存(含解引用句柄——句柄区故意不映射)转 Bail{BadOperand}。
-///
-/// 包不做二进制加载:消费方用 mapCode 灌映射好的代码(PE/ELF 展平段或裸机器
-/// 码),入口地址进 JniEnv::methods。install 前把 memFace() 灌进 env.mem、
-/// executorFace() 灌进 env.executor:
-///   jsim::jniuc::UcNative uc(env);
-///   env.mem = uc.memFace();
-///   env.executor = uc.executorFace();
-///   uc.mapCode(0x00010000, blob, size);
-#pragma once
-
-#include <unicorn/unicorn.h>
+#include "jsim/jni_uc.hpp"
 
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
-#include "jsim/engine.hpp"
-#include "jsim/jni.hpp"
+namespace jsim::jniuc {
 
-namespace jsim {
-namespace jniuc {
-
-/// UC_* 错误码 → 结构化 Bail。guest 侧错误统一 BadOperand/NotConcrete 口径。
-inline Bail ucBail(const char* what, uc_err err)
+Bail ucBail(const char* what, uc_err err)
 {
     return Bail{Bail::Reason::BadOperand, 0, std::string(what) + ": " + uc_strerror(err)};
 }
 
-class UcNative
+class UcNative::Impl
 {
 public:
-    explicit UcNative(jni::JniEnv& env, jni::Layout layout = jni::Layout{})
+    explicit Impl(jni::JniEnv& env, jni::Layout layout)
         : env_(env), layout_(layout)
     {
         uc_err err = uc_open(UC_ARCH_X86, UC_MODE_64, &uc_);
@@ -55,10 +28,10 @@ public:
         installHooks();
     }
 
-    ~UcNative() { if (uc_ != nullptr) uc_close(uc_); }
+    ~Impl() { if (uc_ != nullptr) uc_close(uc_); }
 
-    UcNative(const UcNative&) = delete;
-    UcNative& operator=(const UcNative&) = delete;
+    Impl(const Impl&) = delete;
+    Impl& operator=(const Impl&) = delete;
 
     /// GuestMemory 实现:map 走 scratch 区 bump + 回收链,read/write 走
     /// uc_mem_read/write。灌进 env.mem。
@@ -154,13 +127,13 @@ private:
 
     static void hookTrampoline(uc_engine* uc, u64 addr, u32 size, void* user)
     {
-        static_cast<UcNative*>(user)->onTrap(uc, addr);
+        static_cast<Impl*>(user)->onTrap(uc, addr);
     }
 
     static bool hookBadMem(uc_engine* uc, uc_mem_type type, u64 addr, int size, i64 value,
                            void* user)
     {
-        UcNative* self = static_cast<UcNative*>(user);
+        Impl* self = static_cast<Impl*>(user);
         const char* what = "guest 坏访存";
         if (addr >= jni::HandlePool::kBase && addr < jni::HandlePool::kBase + 0x100000) {
             what = "句柄被解引用(句柄是假指针)";
@@ -512,5 +485,26 @@ private:
     std::unordered_map<u64, usize> scratchOwned_;
 };
 
-} // namespace jniuc
-} // namespace jsim
+UcNative::UcNative(jni::JniEnv& env, jni::Layout layout)
+    : impl_(std::make_unique<Impl>(env, layout))
+{
+}
+
+UcNative::~UcNative() = default;
+
+jni::GuestMemory UcNative::memFace()
+{
+    return impl_->memFace();
+}
+
+jni::NativeExecutor UcNative::executorFace()
+{
+    return impl_->executorFace();
+}
+
+Result<void, Bail> UcNative::mapCode(u64 addr, const void* data, usize size)
+{
+    return impl_->mapCode(addr, data, size);
+}
+
+} // namespace jsim::jniuc

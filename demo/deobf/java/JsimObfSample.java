@@ -92,7 +92,7 @@ public final class JsimObfSample {
     }
 
     /// --gen 打印 PLAINS 的密文十六进制转义字面量（复现调用点密文）；无参则真 JVM 自检。
-    public static void main(String[] args) {
+    public static void main(String[] args) throws java.io.UnsupportedEncodingException {
         if (args.length == 1 && "--gen".equals(args[0])) {
             for (String plain : PLAINS) {
                 String cipher = encryptForGen(plain);
@@ -104,6 +104,8 @@ public final class JsimObfSample {
             }
             return;
         }
+        // 对拍以 UTF-8 字节为准，Windows 的 stdout 代码页可能与 file.encoding 不同。
+        System.setOut(new java.io.PrintStream(System.out, true, "UTF-8"));
         banner();
         dusk();
         dance();

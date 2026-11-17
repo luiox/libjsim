@@ -16,6 +16,8 @@
 
 #include "jsim/engine.hpp"
 #include "jsim/jbc.hpp"
+#include "jsim/math.hpp"
+#include "jsim/random.hpp"
 #include "jsim/str.hpp"
 
 #if defined(_WIN32)
@@ -603,6 +605,26 @@ void testThrowCatch() {
           && static_cast<i32>(r2.returnValue.asU32()) == 6);
 }
 
+void testJdkExtensionFlow() {
+    const Method method = bridgeMethod("randomMathFlow", "(JI)J");
+    Session session;
+    math::install(session);
+    random::install(session);
+
+    // HotSpot 21 执行同一份 class 得出的期望值。
+    auto checkFlow = [&](i64 seed, i32 offset, i64 expected) {
+        Prefill args;
+        args.locals = {SimValue::knownI64(seed), SimValue::unknownOf(ValType::I32),
+                       SimValue::knownI32(offset)};
+        RunResult result = Sim(method, session).runEntry(std::move(args));
+        CHECK(result.kind == RunResult::Kind::Completed && result.hasReturnValue
+              && result.returnValue.known && result.returnValue.type == ValType::I64
+              && result.returnValue.intBits == expected);
+    };
+    checkFlow(0, -36, -282669524157227483ll);
+    checkFlow(-1, 13, 737135261370048515ll);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -644,6 +666,7 @@ int main(int argc, char** argv) {
     testLdcStringSurface();
     testIndyBridge();
     testThrowCatch();
+    testJdkExtensionFlow();
 
     std::printf("jsim-jbc 桥接测试：%d/%d 通过\n", g_total - g_fail, g_total);
     if (g_fail != 0) std::printf("存在失败断言\n");

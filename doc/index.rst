@@ -10,5 +10,6 @@ libjsim 设计规格
    :caption: 设计与契约
 
    design
+   ext-jdk
    ext-jbc
    ext-jni

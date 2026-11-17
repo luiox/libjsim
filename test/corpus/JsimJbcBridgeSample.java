@@ -8,6 +8,13 @@
 /// （class v52；产物 JsimJbcBridgeSample.class 检入本目录，测试读它，
 /// 运行期不需要 JDK）。期望值由 test/jbc/main.cpp 用同算法独立复算。
 public class JsimJbcBridgeSample {
+    public static long randomMathFlow(long seed, int offset) {
+        java.util.Random random = new java.util.Random(seed);
+        int digit = random.nextInt(97);
+        long value = random.nextLong();
+        return Math.floorDiv(value, 11L) + Math.floorMod(digit + offset, 7);
+    }
+
 
     /// invokeinterface 候选：引用落在主类 CP，桥按 InterfaceMethodref 出 CallRef。
     interface Probe {

@@ -331,7 +331,7 @@ public:
         return raw(op::ANewArray, static_cast<i32>(method_.allocTypes.size()) - 1);
     }
 
-    /// multianewarray：elemType 是元素类型（"I" → int[][]），dims ≥ 2；
+    /// multianewarray：elemType 是分配维度后的分量描述符（"I" 与 dims=2 → int[][]），dims ≥ 1；
     /// 栈上按 count1（最外层）… countn（最内层）压入。
     MethodBuilder& multiANewArray(std::string elemType, i32 dims) {
         method_.allocTypes.push_back(std::move(elemType));

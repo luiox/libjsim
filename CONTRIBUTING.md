@@ -1,6 +1,6 @@
 # Contributing
 
-libjsim 的红线是核心零依赖：src/jsim 只有接管面与类型传播，语义注入（字符串、数值、反射、indy、libjbc 桥、JNI）一律进 ext/jsim 扩展包，逐包独立 target；核心对任何扩展包零反向依赖。跨包依赖（如绑定层 → 语义面）须在 xmake.lua 注释里记录理由。细节见 [doc/design.rst](doc/design.rst)。
+核心 `src/jsim/` 提供字节码执行、类型传播和接管面，依赖 C++ 标准库。扩展包将头文件和实现放在 `ext/<包名>/src/jsim/`。在 `ext/xmake.lua` 声明独立 target，并在对应 target 上声明依赖。每个扩展将自己的 `src/` 作为 include 根，消费方用 `jsim/...` 引用公开头。细节见 [doc/design.rst](doc/design.rst)。
 
 ## 构建与测试
 
@@ -14,7 +14,7 @@ xmake run jsim-jni-test
 
 Windows 下需要 Visual Studio 2022 的 C++ 工具链；若 xmake 误选 mingw，显式 `xmake f -p windows --toolchain=msvc`。网络受限时 unicorn 可用 `--unicorn_dir=<dir>` 指向本地预编译目录旁路。
 
-改动 jsim-jni 绑定层（ext/jsim/jni_uc.hpp）时，除 jsim-jni-test 外还要跑 `xmake run jsim-demo-jni`（真 unicorn 执行）与 `xmake run jsim-jni-e2e-test`（真 jar + 真 DLL）；后者语料 jar 缺席时 skip，再生成用 test/jni/sample/build-sample.ps1（需要 JDK 与 MSVC）。
+改动 jsim-jni 绑定层（`ext/jni-uc/`）时，除 jsim-jni-test 外还要跑 `xmake run jsim-demo-jni`（真 unicorn 执行）与 `xmake run jsim-jni-e2e-test`（真 jar + 真 DLL）；后者语料 jar 缺席时 skip，再生成用 test/jni/sample/build-sample.ps1（需要 JDK 与 MSVC）。
 
 ## 语料
 

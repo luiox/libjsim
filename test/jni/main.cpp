@@ -4,8 +4,10 @@
 ///        异常位、用户钩子覆盖、RegisterNatives 录表、未实现函数 Bail。
 ///        期望值由本文件用同算法独立复算,不以被测件自身输出为基准。
 
+#include <array>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 #include <map>
 
 #include "jsim/engine.hpp"
@@ -429,6 +431,75 @@ void testStringRoundtrip()
         CHECK(r.returnValue.ref.str == expected);
     }
     CHECK(env.pool.alive() == 0); // local 全回收(global 才留)
+}
+
+void testStringRegions()
+{
+    Session session;
+    jni::JniEnv env;
+    env.session = &session;
+    FakeMem mem;
+    env.mem = mem.face();
+    jni::installSkeletons(env);
+
+    auto call = [&](const char* name, std::initializer_list<u64> args) {
+        const auto readArg = [args](usize pos) -> Result<u64, Bail> {
+            if (pos == 0 || pos > args.size()) {
+                return Result<u64, Bail>::err({Bail::Reason::StackBroken, 0, "JNI 实参越位"});
+            }
+            return Result<u64, Bail>::ok(*(args.begin() + pos - 1));
+        };
+        return jni::dispatch(env, jni::indexOf(name), readArg, readArg);
+    };
+
+    // A, U+4E2D, NUL, U+1F600 (两个 UTF-16 码元), Z。
+    const auto text = env.pool.makeRef(
+        SimValue::internedStr("A\xe4\xb8\xad\xc0\x80\xed\xa0\xbd\xed\xb8\x80Z"), false);
+    CHECK(text.isOk());
+    if (!text.isOk()) return;
+    const u64 str = text.value();
+    const auto length = call("GetStringLength", {str});
+    CHECK(length.isOk() && length.value() == 6);
+
+    const std::array<u8, 11> expectedUtf = {
+        0xe4, 0xb8, 0xad, 0xc0, 0x80, 0xed, 0xa0, 0xbd, 0xed, 0xb8, 0x80};
+    std::array<u8, expectedUtf.size()> utf{};
+    const u64 utfAddr = mem.putBytes(utf.data(), utf.size());
+    CHECK(call("GetStringUTFRegion", {str, 1, 4, utfAddr}).isOk());
+    CHECK(env.mem.read(utfAddr, utf.data(), utf.size()).isOk() && utf == expectedUtf);
+    const auto badRegion = call("GetStringUTFRegion", {str, 5, 2, utfAddr});
+    CHECK(!badRegion.isOk() && badRegion.error().reason == Bail::Reason::BadOperand);
+    CHECK(call("GetStringRegion", {str, 6, 0, 0}).isOk());
+
+    const std::array<u8, 8> expectedWideRegion = {0x2d, 0x4e, 0, 0, 0x3d, 0xd8, 0, 0xde};
+    std::array<u8, expectedWideRegion.size()> wideRegion{};
+    const u64 wideAddr = mem.putBytes(wideRegion.data(), wideRegion.size());
+    CHECK(call("GetStringRegion", {str, 1, 4, wideAddr}).isOk());
+    CHECK(env.mem.read(wideAddr, wideRegion.data(), wideRegion.size()).isOk() &&
+          wideRegion == expectedWideRegion);
+
+    const auto critical = call("GetStringCritical", {str, 0});
+    CHECK(critical.isOk());
+    if (critical.isOk()) {
+        const std::array<u8, 12> expectedChars = {
+            0x41, 0, 0x2d, 0x4e, 0, 0, 0x3d, 0xd8, 0, 0xde, 0x5a, 0};
+        std::array<u8, expectedChars.size()> chars{};
+        const u64 ptr = critical.value();
+        CHECK(ptr % 2 == 0);
+        CHECK(env.mem.read(ptr, chars.data(), chars.size()).isOk() && chars == expectedChars);
+        CHECK(call("ReleaseStringCritical", {str, ptr}).isOk());
+        CHECK(!env.mem.read(ptr, chars.data(), chars.size()).isOk());
+    }
+
+    const auto empty = call("NewString", {0, 0});
+    CHECK(empty.isOk() && empty.value() != 0);
+    if (empty.isOk()) {
+        const auto value = env.pool.deref(empty.value());
+        CHECK(value.isOk() && value.value().ref.kind == RefPayload::Kind::Str &&
+              value.value().ref.str.empty());
+    }
+    const auto badLength = call("NewString", {wideAddr, 0xffffffffu});
+    CHECK(!badLength.isOk() && badLength.error().reason == Bail::Reason::BadOperand);
 }
 
 void testStaticFieldBridge()
@@ -884,6 +955,7 @@ int main()
     testArgEncoding();
     testInstanceReceiver();
     testStringRoundtrip();
+    testStringRegions();
     testStaticFieldBridge();
     testCallMethodA();
     testExceptions();

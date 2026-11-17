@@ -85,8 +85,18 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      - name: Build without third-party packages
+        run: |
+          xmake f -y --with_jbc=n --with_unicorn=n
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          xmake build -y
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          xmake run jsim-test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          xmake run jsim-jni-test
+
       - name: configure
-        run: xmake f -y
+        run: xmake f -y --with_jbc=y --with_unicorn=y
 
       - name: build
         run: xmake build -y

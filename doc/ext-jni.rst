@@ -12,10 +12,10 @@ j2c 混淆器把 Java 方法编译成 native 函数，体内经 JNIEnv 函数表
 依赖声明与零依赖边界
 --------------------
 
-- \ ``jsim-jni``\ （ext/jsim/jni.hpp）是**纯层**，零外部依赖：JNI 函数表常量、钩子分发、句柄池、参数编组、默认骨架、install 接缝。测试用 FakeMachine 驱动，不需要 unicorn。
-- \ ``jsim-jni-uc``\ （ext/jsim/jni_uc.hpp）是**绑定层**，依赖外部包 unicorn（2.1.4，经官方 xmake-repo）与纯层：unicorn 引擎持有、JNIEnv 表与 trap page 物化、x86-64 ABI（Win64 + SysV）寄存器编组、步数熔断。
+- \ ``jsim-jni``\ （公开头 ``jsim/jni.hpp``）提供 JNI 函数表、钩子分发、句柄池、编组、默认钩子与安装接口。头文件和实现位于 ``ext/jni/src/jsim/``，测试由 FakeMachine 驱动。
+- \ ``jsim-jni-uc``\ （公开头 ``jsim/jni_uc.hpp``）依赖 jsim-jni 和 Unicorn 2.1.4，提供 JNIEnv 表、trap page、x86-64 Win64/SysV ABI 编组和步数限制。头文件和实现位于 ``ext/jni-uc/src/jsim/``。
 - 依赖纪律的例外记录：设计稿 :ref:`design-testing` 的「扩展包互不依赖」指语义包之间；绑定层依赖语义面（jni-uc → jni）与外部机器（uc）是位面分层，不是语义堆叠。jsim-jni 是第二个带外部依赖的包位面（第一个是 jsim-jbc）。
-- 核心零依赖红线不动：src/jsim 纯 std 头文件，对两个包零反向依赖。
+- 核心 ``src/jsim/`` 依赖 C++ 标准库。
 
 .. _ext-jni-chain:
 
@@ -72,7 +72,15 @@ API 面（纯层）
 
 **句柄池**：句柄是 8 对齐单调发号的假 guest 指针，不对应任何真实内存，绑定层不为它映射页。ref 句柄背 SimValue（Null/Str/Obj 载荷），memberID 句柄背 (owner, name, desc)。local 句柄一次 native 调用结束统一回收，global 句柄（NewGlobalRef）跨调用持久——缓存 jclass 的解密器依赖这一点。悬空句柄一律 Bail{BadOperand}。
 
-**内存物化**：GetStringUTFChars / GetStringChars / Get\*ArrayElements / Get\*Critical 在 scratch 区物化一份副本，返回 guest 指针。Release\*ArrayElements 按 JNI 契约处理 mode：0=写回+回收，JNI_COMMIT(1)=写回不回收，JNI_ABORT(2)=丢弃副本只回收。Get\*Region / Set\*Region 系不经副本直通 Session 堆，元素宽度按数组类名（[Z/[B=1，[C/[S=2，[I/[F=4，[J/[D=8）。字符串字节按家族口径 MUTF-8 原样透传（GetStringUTFChars 不转码）；GetStringChars / GetStringLength 按 UTF-16 码元解码（BMP 假设，同 jsim-str 家族口径）。
+GetStringUTFChars、GetStringChars、GetStringCritical 和 Get\*ArrayElements 在 scratch
+区物化副本并返回 guest 指针。GetStringUTFChars 透传已有的 MUTF-8 载荷，
+GetStringChars 和 GetStringCritical 返回 UTF-16 码元。字符串 Region 接口按
+UTF-16 码元切片，GetStringUTFRegion 将切片编码成 MUTF-8。
+
+Release\*ArrayElements 的 mode 为 0 时写回并回收，JNI_COMMIT(1) 时写回并保留
+副本，JNI_ABORT(2) 时丢弃副本。数组 Region 接口直接读写 Session 堆。元素
+宽度由数组类名决定，[Z 和 [B 为 1 字节，[C 和 [S 为 2 字节，[I 和 [F 为
+4 字节，[J 和 [D 为 8 字节。
 
 **ABI 编组**：Win64 是位置制——前四槽 p=0..3 各对应 RCX/RDX/R8/R9 或 XMM0..3（同槽编号，不按类计数），p≥4 落栈并先垫 0x20 影子空间；SysV 是类计数制——整数 6 + 浮点 8 寄存器各自按序消耗，耗尽后按落栈序占 8 字节槽。混类签名下两 ABI 不可混用公式。
 

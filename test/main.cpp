@@ -12,6 +12,9 @@
 
 using namespace jsim;
 
+int testJdkPackages();
+int testStrExtensions();
+
 namespace {
 
 int g_total = 0;
@@ -77,6 +80,27 @@ void testArithmetic() {
     CHECK(completedWith(runII(INT32_MIN, -1, op::IRem), 0));
     CHECK(completedWith(runII(-1, 1, op::IUshr), 2147483647));
 
+    const auto runIinc = [&](i32 value, i32 delta) {
+        Method m = MethodBuilder("inc", "(I)I", 1).iinc(0, delta).iload(0).ireturn().build();
+        Prefill p;
+        p.locals = {SimValue::knownI32(value)};
+        return runIt(m, s, std::move(p));
+    };
+    CHECK(completedWith(runIinc(INT32_MAX, 1), INT32_MIN));
+    CHECK(completedWith(runIinc(INT32_MIN, -1), INT32_MAX));
+
+    Method intNeg = MethodBuilder("neg", "()I", 0).ldcI(INT32_MIN)
+                        .raw(op::INeg).ireturn().build();
+    CHECK(completedWith(runIt(intNeg, s), INT32_MIN));
+    for (const i64 operand : {i64{7}, i64{INT64_MIN}}) {
+        Method longNeg = MethodBuilder("neg", "()J", 0).ldcLong(operand)
+                            .raw(op::LNeg).raw(op::LReturn).build();
+        const RunResult negated = runIt(longNeg, s);
+        CHECK(negated.kind == RunResult::Kind::Completed && negated.hasReturnValue &&
+              negated.returnValue.type == ValType::I64 && negated.returnValue.known &&
+              negated.returnValue.asU64() == u64{0} - static_cast<u64>(operand));
+    }
+
     RunResult divZero = runII(7, 0, op::IDiv);
     CHECK(divZero.kind == RunResult::Kind::Bailed &&
           divZero.bail.reason == Bail::Reason::NotConcrete); // 除零需异常派发
@@ -124,6 +148,24 @@ void testArithmetic() {
     RunResult ua = runIt(add, s, std::move(pu));
     CHECK(ua.kind == RunResult::Kind::Completed && !ua.returnValue.known &&
           ua.returnValue.type == ValType::I32);
+}
+
+void testInstanceOf() {
+    Session s;
+    Method m = MethodBuilder("test", "(Ljava/lang/Object;)I", 1)
+                   .aload(0)
+                   .raw(op::InstanceOf)
+                   .ireturn()
+                   .build();
+    Prefill nullRef;
+    nullRef.locals = {SimValue::knownNull()};
+    CHECK(completedWith(runIt(m, s, std::move(nullRef)), 0));
+
+    Prefill unknownRef;
+    unknownRef.locals = {SimValue::unknownOf(ValType::Ref)};
+    const RunResult unknown = runIt(m, s, std::move(unknownRef));
+    CHECK(unknown.kind == RunResult::Kind::Completed && unknown.hasReturnValue &&
+          unknown.returnValue.type == ValType::I32 && !unknown.returnValue.known);
 }
 
 // ── 分支：接管收完整帧、三态裁决、acmp 身份、switch 纪律（design-takeover）──────────────
@@ -327,6 +369,14 @@ void testFieldFace() {
     unk.locals = {SimValue::unknownOf(ValType::Ref)};
     RunResult propagated = runIt(gf, s, std::move(unk));
     CHECK(propagated.kind == RunResult::Kind::Completed && !propagated.returnValue.known);
+
+    const Method pf = MethodBuilder("pf", "()V", 0)
+        .putField("p", "x", "I", ValType::I32).vreturn().build();
+    Prefill unknownWrite;
+    unknownWrite.stack = {SimValue::unknownOf(ValType::Ref), SimValue::knownI32(1)};
+    const RunResult fieldWrite = runIt(pf, s, std::move(unknownWrite));
+    CHECK(fieldWrite.kind == RunResult::Kind::Bailed &&
+          fieldWrite.bail.reason == Bail::Reason::NotConcrete);
 }
 
 // ── 观测面（design-takeover）：结构化步进、Bail 现场、帧快照、断点熔断与续跑 ─────────────
@@ -495,7 +545,7 @@ void testArraysAndAlloc() {
     CHECK(ur.kind == RunResult::Kind::Completed && !ur.returnValue.known &&
           ur.returnValue.type == ValType::I32);
 
-    // aastore 值未知：整体跳写不落假值；读取仍得初始 null。
+    // aastore 可以把 Unknown 写进精确定位的引用槽。
     Method aa = MethodBuilder("aa", "()Ljava/lang/Object;", 2)
                     .iconst(1)
                     .anewArray("Ljava/lang/Object;")
@@ -512,8 +562,23 @@ void testArraysAndAlloc() {
     Prefill aap;
     aap.locals = {SimValue::unknownOf(ValType::Ref), SimValue::unknownOf(ValType::Ref)};
     RunResult aar = runIt(aa, s, std::move(aap));
-    CHECK(aar.kind == RunResult::Kind::Completed && aar.returnValue.known &&
-          aar.returnValue.ref.kind == RefPayload::Kind::Null);
+    CHECK(aar.kind == RunResult::Kind::Completed && !aar.returnValue.known &&
+          aar.returnValue.type == ValType::Ref);
+
+    // 基本数组无法表示未知值，写入应停止，不能继续把旧值当成确定结果。
+    const Method ia = MethodBuilder("ia", "()V", 0).iastore().vreturn().build();
+    const Method newInts = MethodBuilder("newInts", "()[I", 0)
+        .iconst(1).newArray(10).areturn().build();
+    const SimValue ints = runIt(newInts, s).returnValue;
+    Prefill unknownValue;
+    unknownValue.stack = {ints, SimValue::knownI32(0), SimValue::unknownOf(ValType::I32)};
+    RunResult valueWrite = runIt(ia, s, std::move(unknownValue));
+    CHECK(valueWrite.kind == RunResult::Kind::Bailed && valueWrite.bail.reason == Bail::Reason::NotConcrete);
+
+    Prefill unknownIndex;
+    unknownIndex.stack = {ints, SimValue::unknownOf(ValType::I32), SimValue::knownI32(1)};
+    RunResult indexWrite = runIt(ia, s, std::move(unknownIndex));
+    CHECK(indexWrite.kind == RunResult::Kind::Bailed && indexWrite.bail.reason == Bail::Reason::NotConcrete);
 
     // multianewarray 全维分配：2×3 int[][]，内层长度可达、类名正确。
     Method m2 = MethodBuilder("m2", "()I", 1)
@@ -528,6 +593,18 @@ void testArraysAndAlloc() {
                     .ireturn()
                     .build();
     CHECK(completedWith(runIt(m2, s), 3));
+
+    // 只修改第一行。两行同一列的差始终是写入值。
+    Method separateRows = MethodBuilder("rows", "()I", 1)
+                              .iconst(2)
+                              .iconst(1)
+                              .multiANewArray("I", 2)
+                              .astore(0)
+                              .aload(0).iconst(0).aaload().iconst(0).iconst(7).iastore()
+                              .aload(0).iconst(0).aaload().iconst(0).iaload()
+                              .aload(0).iconst(1).aaload().iconst(0).iaload()
+                              .isub().ireturn().build();
+    CHECK(completedWith(runIt(separateRows, s), 7));
 
     Session s2;
     Method m2ref = MethodBuilder("m2r", "()Ljava/lang/Object;", 0)
@@ -568,6 +645,19 @@ void testArraysAndAlloc() {
                      .build();
     RunResult negR = runIt(neg, s2);
     CHECK(negR.kind == RunResult::Kind::Bailed && negR.bail.reason == Bail::Reason::BadOperand);
+
+    // 每一维在上限内，累计分配量超限时堆及对象编号保持原样。
+    const usize heapSize = s2.heap.size();
+    const u64 nextAllocId = s2.nextAllocId;
+    Method huge = MethodBuilder("huge", "()[[I", 0)
+                      .ldcI(1024)
+                      .ldcI(1024)
+                      .multiANewArray("I", 2)
+                      .areturn()
+                      .build();
+    const RunResult capped = runIt(huge, s2);
+    CHECK(capped.kind == RunResult::Kind::Bailed && capped.bail.reason == Bail::Reason::BadOperand);
+    CHECK(s2.heap.size() == heapSize && s2.nextAllocId == nextAllocId);
 
     // new：未注册脚手架 Bail；注册后建堆对象。
     Method nw = MethodBuilder("nw", "()Ljava/lang/Object;", 0)
@@ -827,6 +917,12 @@ void testThrowDispatch() {
     CHECK(r.kind == RunResult::Kind::Completed);
     CHECK(r.finalStack.size() == 1 && r.finalStack.front().type == ValType::Ref);
 
+    Prefill nullThrow;
+    nullThrow.stack = {SimValue::knownNull()};
+    RunResult nullResult = runIt(any, s, std::move(nullThrow));
+    CHECK(nullResult.kind == RunResult::Kind::Bailed &&
+          nullResult.bail.reason == Bail::Reason::NotConcrete);
+
     // 具名 catch + 已知堆对象：类名与 catchType 精确相等才派发。
     Method named = MethodBuilder("t2", "(I)V", 2)
                        .raw(op::AThrow) // 0
@@ -870,6 +966,7 @@ void testThrowDispatch() {
 int main() {
     testValueAlgebra();
     testArithmetic();
+    testInstanceOf();
     testBranchFace();
     testCallFace();
     testFieldFace();
@@ -883,5 +980,7 @@ int main() {
     testIndyPackage();
     testThrowDispatch();
     std::printf("[jsim-test] %d 项断言，%d 失败\n", g_total, g_fail);
-    return g_fail == 0 ? 0 : 1;
+    const int jdkFailures = testJdkPackages();
+    const int strFailures = testStrExtensions();
+    return g_fail == 0 && jdkFailures == 0 && strFailures == 0 ? 0 : 1;
 }
